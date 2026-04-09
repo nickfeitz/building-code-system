@@ -1,0 +1,42 @@
+# Secrets / local config
+.env
+.env.local
+*.env.local
+
+# Large test PDFs (seed data, kept on disk but not in git)
+test-admin-code.pdf
+test-cbc-part2-vol1.pdf
+test-title24-guide.pdf
+*.pdf
+
+# Claude Code worktrees and state (managed by another repo)
+.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# Node
+node_modules/
+dist/
+build/
+.next/
+.vite/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
