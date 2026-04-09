@@ -36,14 +36,18 @@ building-code-system/
   - Port: 5432
   - User: `postgres`
   - Password: `F31t53r1`
-  - Database: `appdb`
+  - Database: `building_code` — **dedicated to this project**; do not share with NocoDB, n8n, or reconciliation-platform
   - Extensions: pgvector, pg_trgm (pre-installed)
 
 ### 2. Initialize Database
 
 ```bash
-# Create schema
-docker exec -i postgres psql -U postgres -d appdb < backend/schema.sql
+# Create the dedicated database (first time only)
+docker exec postgres psql -U postgres -c "CREATE DATABASE building_code OWNER postgres;"
+docker exec postgres psql -U postgres -d building_code -c "CREATE EXTENSION IF NOT EXISTS vector; CREATE EXTENSION IF NOT EXISTS pg_trgm;"
+
+# Apply schema
+docker exec -i postgres psql -U postgres -d building_code < backend/schema.sql
 
 # Seed initial data (optional)
 docker build -t bcs-backend backend/
@@ -52,7 +56,7 @@ docker run --rm --network postgres-stack_default \
   -e POSTGRES_PORT=5432 \
   -e POSTGRES_USER=postgres \
   -e POSTGRES_PASSWORD=F31t53r1 \
-  -e POSTGRES_DB=appdb \
+  -e POSTGRES_DB=building_code \
   bcs-backend python seed.py
 ```
 
@@ -145,7 +149,7 @@ docker compose ps
 - `POSTGRES_PORT=5432`
 - `POSTGRES_USER=postgres`
 - `POSTGRES_PASSWORD=F31t53r1`
-- `POSTGRES_DB=appdb`
+- `POSTGRES_DB=building_code`
 - `CLAUDE_API_KEY=sk-ant-CHANGEME`
 - `EMBEDDING_SERVICE_URL=http://embedding-service:8011`
 - `BACKEND_PORT=8010`
@@ -215,7 +219,7 @@ POSTGRES_HOST=postgres
 POSTGRES_PORT=5432
 POSTGRES_USER=postgres
 POSTGRES_PASSWORD=F31t53r1
-POSTGRES_DB=appdb
+POSTGRES_DB=building_code
 CLAUDE_API_KEY=sk-ant-CHANGEME
 EMBEDDING_MODEL=intfloat/e5-large-v2
 EMBEDDING_PORT=8011
@@ -365,13 +369,13 @@ docker network inspect postgres-stack_default
 
 ```bash
 # Test PostgreSQL
-docker exec postgres psql -U postgres -d appdb -c "SELECT 1"
+docker exec postgres psql -U postgres -d building_code -c "SELECT 1"
 
 # Verify extensions
-docker exec postgres psql -U postgres -d appdb -c "\dx"
+docker exec postgres psql -U postgres -d building_code -c "\dx"
 
 # Check schema creation
-docker exec postgres psql -U postgres -d appdb -c "\dt"
+docker exec postgres psql -U postgres -d building_code -c "\dt"
 ```
 
 ### Embedding service not responding

@@ -8,7 +8,7 @@
    - Port: 5432
    - User: `postgres`
    - Password: `F31t53r1`
-   - Database: `appdb`
+   - Database: `building_code`
    - Network: `postgres-stack_default`
    - Extensions: pgvector, pg_trgm (already installed)
 
@@ -33,7 +33,7 @@ Before starting the services, initialize the database schema:
 
 ```bash
 # Connect to postgres container and run schema
-docker exec -i postgres psql -U postgres -d appdb < backend/schema.sql
+docker exec -i postgres psql -U postgres -d building_code < backend/schema.sql
 
 # Seed initial data (optional)
 # Build the backend image first to have Python available
@@ -43,7 +43,7 @@ docker run --rm --network postgres-stack_default \
   -e POSTGRES_PORT=5432 \
   -e POSTGRES_USER=postgres \
   -e POSTGRES_PASSWORD=F31t53r1 \
-  -e POSTGRES_DB=appdb \
+  -e POSTGRES_DB=building_code \
   building-code-backend python seed.py
 ```
 
@@ -142,7 +142,7 @@ POSTGRES_HOST=postgres
 POSTGRES_PORT=5432
 POSTGRES_USER=postgres
 POSTGRES_PASSWORD=F31t53r1
-POSTGRES_DB=appdb
+POSTGRES_DB=building_code
 CLAUDE_API_KEY=sk-ant-CHANGEME
 EMBEDDING_MODEL=intfloat/e5-large-v2
 EMBEDDING_PORT=8011
@@ -188,7 +188,7 @@ docker compose logs backend
 docker compose logs frontend
 
 # Verify PostgreSQL connection
-docker exec postgres psql -U postgres -d appdb -c "SELECT 1"
+docker exec postgres psql -U postgres -d building_code -c "SELECT 1"
 
 # Verify network
 docker network ls
@@ -202,8 +202,8 @@ docker network inspect postgres-stack_default
 docker exec backend python -c "import asyncpg; print('asyncpg OK')"
 
 # Check PostgreSQL extensions
-docker exec postgres psql -U postgres -d appdb -c "CREATE EXTENSION IF NOT EXISTS pgvector"
-docker exec postgres psql -U postgres -d appdb -c "CREATE EXTENSION IF NOT EXISTS pg_trgm"
+docker exec postgres psql -U postgres -d building_code -c "CREATE EXTENSION IF NOT EXISTS pgvector"
+docker exec postgres psql -U postgres -d building_code -c "CREATE EXTENSION IF NOT EXISTS pg_trgm"
 ```
 
 ### Embedding service errors
