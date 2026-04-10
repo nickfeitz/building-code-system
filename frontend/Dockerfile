@@ -1,9 +1,20 @@
+# syntax=docker/dockerfile:1.6
+
+# ---- build stage --------------------------------------------------------
+FROM node:20-alpine AS build
+WORKDIR /app
+COPY package.json package-lock.json* ./
+# package-lock.json may not exist yet on a fresh checkout — fall back to npm install
+RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
+COPY . .
+RUN npm run build
+
+# ---- runtime stage ------------------------------------------------------
 FROM nginx:1.25-alpine
 
 RUN rm /etc/nginx/conf.d/default.conf
-
 COPY nginx.conf /etc/nginx/conf.d/default.conf
-COPY --chmod=644 index.html /usr/share/nginx/html/
+COPY --from=build /app/dist /usr/share/nginx/html
 
 EXPOSE 80
 
