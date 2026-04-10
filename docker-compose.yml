@@ -37,6 +37,7 @@ services:
       - BACKEND_PORT=${BACKEND_PORT}
       - OLLAMA_URL=${OLLAMA_URL}
       - OLLAMA_MODEL=${OLLAMA_MODEL}
+      - OLLAMA_NUM_CTX=${OLLAMA_NUM_CTX:-8192}
       - LLM_PROVIDER=${LLM_PROVIDER}
       - SCRAPER_SERVICE_URL=http://scraper-service:8012
     depends_on:

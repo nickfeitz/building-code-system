@@ -41,6 +41,7 @@ PDF_UPLOAD_DIR = os.getenv("PDF_UPLOAD_DIR", "/tmp/pdf_uploads")
 # LLM Configuration
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://host.docker.internal:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:30b")
+OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "8192"))  # KV cache size; Ollama's default (context_length) can be huge (256K) and blow up first-load
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama")  # "ollama" or "claude"
 
 # Database connection string
@@ -329,7 +330,8 @@ async def check_ollama() -> Dict[str, Any]:
 async def get_embedding(text: str) -> Optional[List[float]]:
     """Get embedding from embedding service"""
     try:
-        async with httpx.AsyncClient(timeout=30.0) as http_client:
+        # Generous timeout: cold model warm-up can take ~30s after a container recreate
+        async with httpx.AsyncClient(timeout=120.0) as http_client:
             response = await http_client.post(
                 f"{EMBEDDING_SERVICE_URL}/embed",
                 json={"text": text}
@@ -390,7 +392,8 @@ async def call_ollama_stream(messages: List[Dict], model: str, system_prompt: st
                     json={
                         "model": model,
                         "messages": formatted_messages,
-                        "stream": True
+                        "stream": True,
+                        "options": {"num_ctx": OLLAMA_NUM_CTX},
                     }
                 ) as response:
                     if response.status_code == 200:
