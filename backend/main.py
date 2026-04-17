@@ -1167,6 +1167,234 @@ async def list_code_books():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/catalog")
+async def get_catalog():
+    """Return the full code catalog grouped by adopting authority and cycle.
+
+    Includes per-book indexed_section_count and scan_status (derived from
+    the latest import_sources row for that book). Used by the Catalog
+    panel in the dashboard.
+    """
+    try:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                WITH section_counts AS (
+                    SELECT code_book_id, count(*)::int AS cnt
+                    FROM code_sections GROUP BY code_book_id
+                ),
+                latest_import AS (
+                    SELECT DISTINCT ON (code_book_id)
+                        code_book_id, id AS source_id, status, last_crawled,
+                        sections_imported, next_crawl_at
+                    FROM import_sources
+                    WHERE code_book_id IS NOT NULL
+                    ORDER BY code_book_id, last_crawled DESC NULLS LAST, id DESC
+                )
+                SELECT
+                    po.abbreviation   AS org_abbr,
+                    po.full_name      AS org_full_name,
+                    cc.id             AS cycle_id,
+                    cc.name           AS cycle_name,
+                    cc.adopting_authority,
+                    cc.effective_date AS cycle_effective_date,
+                    cc.expiration_date AS cycle_expiration_date,
+                    cc.status         AS cycle_status,
+                    cb.id             AS book_id,
+                    cb.code_name,
+                    cb.abbreviation   AS book_abbr,
+                    cb.part_number,
+                    cb.category,
+                    cb.base_model_abbreviation,
+                    cb.base_code_year,
+                    cb.digital_access_url,
+                    cb.status         AS book_status,
+                    cb.effective_date AS book_effective_date,
+                    cb.superseded_date AS book_superseded_date,
+                    COALESCE(sc.cnt, 0)   AS indexed_section_count,
+                    li.source_id,
+                    li.status         AS import_status,
+                    li.last_crawled,
+                    li.sections_imported
+                FROM code_books cb
+                JOIN code_cycles cc ON cc.id = cb.cycle_id
+                JOIN publishing_orgs po ON po.id = cb.publishing_org_id
+                LEFT JOIN section_counts sc ON sc.code_book_id = cb.id
+                LEFT JOIN latest_import li ON li.code_book_id = cb.id
+                ORDER BY cc.adopting_authority, cc.effective_date DESC,
+                         cb.part_number NULLS LAST, cb.abbreviation
+                """
+            )
+
+            # Re-shape the flat rows into authority → cycles → books.
+            authorities: dict[str, dict] = {}
+            for r in rows:
+                auth_key = r["adopting_authority"]
+                auth = authorities.setdefault(auth_key, {
+                    "adopting_authority": auth_key,
+                    "publishing_org_abbr": r["org_abbr"],
+                    "publishing_org_full_name": r["org_full_name"],
+                    "cycles": {},
+                })
+                cyc = auth["cycles"].setdefault(r["cycle_id"], {
+                    "id": r["cycle_id"],
+                    "name": r["cycle_name"],
+                    "effective_date": r["cycle_effective_date"].isoformat() if r["cycle_effective_date"] else None,
+                    "expiration_date": r["cycle_expiration_date"].isoformat() if r["cycle_expiration_date"] else None,
+                    "status": r["cycle_status"],
+                    "books": [],
+                })
+
+                # Derive scan_status: not_scanned | scheduled | crawling | indexed | error
+                indexed = r["indexed_section_count"] or 0
+                import_status = r["import_status"]
+                if import_status in (None, "pending") and indexed == 0:
+                    scan_status = "not_scanned"
+                elif import_status == "crawling":
+                    scan_status = "crawling"
+                elif import_status == "error":
+                    scan_status = "error"
+                elif indexed > 0:
+                    scan_status = "indexed"
+                else:
+                    scan_status = import_status or "not_scanned"
+
+                cyc["books"].append({
+                    "id": r["book_id"],
+                    "code_name": r["code_name"],
+                    "abbreviation": r["book_abbr"],
+                    "part_number": r["part_number"],
+                    "category": r["category"],
+                    "base_model_abbreviation": r["base_model_abbreviation"],
+                    "base_code_year": r["base_code_year"],
+                    "digital_access_url": r["digital_access_url"],
+                    "status": r["book_status"],
+                    "effective_date": r["book_effective_date"].isoformat() if r["book_effective_date"] else None,
+                    "superseded_date": r["book_superseded_date"].isoformat() if r["book_superseded_date"] else None,
+                    "indexed_section_count": indexed,
+                    "scan_status": scan_status,
+                    "source_id": r["source_id"],
+                    "last_crawled": r["last_crawled"].isoformat() if r["last_crawled"] else None,
+                })
+
+            # Flatten dicts → lists, preserving insertion order (Python 3.7+).
+            result = []
+            for auth in authorities.values():
+                auth_out = {
+                    "adopting_authority": auth["adopting_authority"],
+                    "publishing_org_abbr": auth["publishing_org_abbr"],
+                    "publishing_org_full_name": auth["publishing_org_full_name"],
+                    "cycles": list(auth["cycles"].values()),
+                }
+                result.append(auth_out)
+            return {"authorities": result}
+    except Exception as e:
+        logger.error(f"Catalog error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class CatalogScanRequest(BaseModel):
+    code_book_ids: List[int]
+
+
+@app.post("/api/catalog/scan")
+async def catalog_scan(req: CatalogScanRequest):
+    """Trigger a scan for the given code_book_ids.
+
+    For each book:
+      - if digital_access_url is NULL  -> skipped_no_url
+      - else: find or create an import_sources row + fire the ICC scraper
+        in the background; the book's scan_status will flip to 'crawling'.
+    """
+    if not req.code_book_ids:
+        raise HTTPException(status_code=400, detail="code_book_ids is required")
+
+    triggered: list[dict] = []
+    skipped_no_url: list[dict] = []
+    errors: list[dict] = []
+
+    try:
+        async with db_pool.acquire() as conn:
+            books = await conn.fetch(
+                """SELECT id, code_name, abbreviation, digital_access_url
+                   FROM code_books WHERE id = ANY($1::int[])""",
+                req.code_book_ids,
+            )
+            book_map = {b["id"]: b for b in books}
+            missing = [bid for bid in req.code_book_ids if bid not in book_map]
+            for bid in missing:
+                errors.append({"code_book_id": bid, "error": "code_book not found"})
+
+            for book in books:
+                if not book["digital_access_url"]:
+                    skipped_no_url.append({
+                        "code_book_id": book["id"],
+                        "code_name": book["code_name"],
+                    })
+                    continue
+
+                # Find or create a web_scrape import_sources row for this book.
+                src = await conn.fetchrow(
+                    """SELECT id FROM import_sources
+                       WHERE code_book_id = $1 AND source_type = 'web_scrape'
+                       ORDER BY id DESC LIMIT 1""",
+                    book["id"],
+                )
+                if src:
+                    source_id = src["id"]
+                    await conn.execute(
+                        """UPDATE import_sources
+                           SET source_url = $1, status = 'pending', updated_at = NOW()
+                           WHERE id = $2""",
+                        book["digital_access_url"], source_id,
+                    )
+                else:
+                    source_id = await conn.fetchval(
+                        """INSERT INTO import_sources
+                               (source_name, source_url, source_type,
+                                code_book_id, status)
+                           VALUES ($1, $2, 'web_scrape', $3, 'pending')
+                           RETURNING id""",
+                        f"Catalog scan: {book['code_name']}",
+                        book["digital_access_url"],
+                        book["id"],
+                    )
+
+                # Kick off the ICC scraper in the background. We only have one
+                # scraper today; non-ICC URLs will error asynchronously, which
+                # surfaces in the Import panel.
+                if "iccsafe.org" in book["digital_access_url"]:
+                    asyncio.create_task(
+                        scrape_runner.run_icc_import(
+                            code_url=book["digital_access_url"],
+                            code_book_id=book["id"],
+                            db_pool=db_pool,
+                            embedding_url=EMBEDDING_SERVICE_URL,
+                            source_id=source_id,
+                        )
+                    )
+                    triggered.append({
+                        "code_book_id": book["id"],
+                        "code_name": book["code_name"],
+                        "source_id": source_id,
+                        "scraper": "icc",
+                    })
+                else:
+                    errors.append({
+                        "code_book_id": book["id"],
+                        "error": "no scraper for this URL host yet — upload a PDF via Import panel or use an ICC URL",
+                    })
+
+        return {
+            "triggered": triggered,
+            "skipped_no_url": skipped_no_url,
+            "errors": errors,
+        }
+    except Exception as e:
+        logger.error(f"Catalog scan error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/llm/status", response_model=LLMStatusResponse)
 async def get_llm_status():
     """Get LLM provider status and configuration"""
