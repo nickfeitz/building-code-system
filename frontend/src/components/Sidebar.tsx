@@ -1,6 +1,6 @@
 import { useHealth } from "../hooks/useHealth";
 
-export type PanelKey = "dashboard" | "chat" | "browser" | "import" | "quarantine";
+export type PanelKey = "dashboard" | "chat" | "browser" | "catalog" | "import" | "quarantine";
 
 interface NavItem {
   key: PanelKey;
@@ -13,6 +13,7 @@ const NAV: NavItem[] = [
   { key: "dashboard", label: "Dashboard", icon: "📊", group: "System" },
   { key: "chat", label: "Chat", icon: "💬", group: "Main" },
   { key: "browser", label: "Code Browser", icon: "📚", group: "Main" },
+  { key: "catalog", label: "Catalog", icon: "📖", group: "Management" },
   { key: "import", label: "Import", icon: "📥", group: "Management" },
   { key: "quarantine", label: "Quarantine", icon: "🛡️", group: "Management" },
 ];

@@ -3,6 +3,7 @@ import { Sidebar, type PanelKey } from "./components/Sidebar";
 import { DashboardPanel } from "./panels/DashboardPanel";
 import { ChatPanel } from "./panels/ChatPanel";
 import { BrowserPanel } from "./panels/BrowserPanel";
+import { CatalogPanel } from "./panels/CatalogPanel";
 import { ImportPanel } from "./panels/ImportPanel";
 import { QuarantinePanel } from "./panels/QuarantinePanel";
 
@@ -10,6 +11,7 @@ const TITLES: Record<PanelKey, string> = {
   dashboard: "Dashboard",
   chat: "Ask the Code",
   browser: "Code Browser",
+  catalog: "Code Catalog",
   import: "Import",
   quarantine: "Quarantine Review",
 };
@@ -28,6 +30,7 @@ export default function App() {
           {panel === "dashboard" && <DashboardPanel />}
           {panel === "chat" && <ChatPanel />}
           {panel === "browser" && <BrowserPanel />}
+          {panel === "catalog" && <CatalogPanel />}
           {panel === "import" && <ImportPanel />}
           {panel === "quarantine" && <QuarantinePanel />}
         </div>

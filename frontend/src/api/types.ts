@@ -66,3 +66,64 @@ export interface QuarantineItem {
   content?: string;
   created_at?: string;
 }
+
+// --- Catalog ---------------------------------------------------------------
+
+export type ScanStatus =
+  | "not_scanned"
+  | "crawling"
+  | "indexed"
+  | "error"
+  | string;
+
+export interface CatalogBook {
+  id: number;
+  code_name: string;
+  abbreviation: string;
+  part_number: string | null;
+  category: string | null;
+  base_model_abbreviation: string | null;
+  base_code_year: number | null;
+  digital_access_url: string | null;
+  status: "active" | "superseded" | "upcoming" | string;
+  effective_date: string | null;
+  superseded_date: string | null;
+  indexed_section_count: number;
+  scan_status: ScanStatus;
+  source_id: number | null;
+  last_crawled: string | null;
+}
+
+export interface CatalogCycle {
+  id: number;
+  name: string;
+  effective_date: string | null;
+  expiration_date: string | null;
+  status: "active" | "superseded" | "upcoming" | string;
+  books: CatalogBook[];
+}
+
+export interface CatalogAuthority {
+  adopting_authority: string;
+  publishing_org_abbr: string;
+  publishing_org_full_name: string;
+  cycles: CatalogCycle[];
+}
+
+export interface CatalogResponse {
+  authorities: CatalogAuthority[];
+}
+
+export interface CatalogScanResponse {
+  triggered: {
+    code_book_id: number;
+    code_name: string;
+    source_id: number;
+    scraper: string;
+  }[];
+  skipped_no_url: {
+    code_book_id: number;
+    code_name: string;
+  }[];
+  errors: { code_book_id: number; error: string }[];
+}
