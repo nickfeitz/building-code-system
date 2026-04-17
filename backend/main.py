@@ -962,31 +962,57 @@ async def upload_pdf(
                 sha256, size, pdf_bytes,
             )
 
+            # Dedicated import_sources row for PDF uploads per book.
+            # Find-or-create so many uploads of the same book share a source.
+            src = await conn.fetchrow(
+                """SELECT id FROM import_sources
+                   WHERE code_book_id = $1 AND source_type = 'pdf_parse'
+                   ORDER BY id DESC LIMIT 1""",
+                code_book_id,
+            )
+            if src:
+                source_id = src["id"]
+            else:
+                source_id = await conn.fetchval(
+                    """INSERT INTO import_sources
+                           (source_name, source_type, code_book_id, status)
+                       VALUES ($1, 'pdf_parse', $2, 'pending')
+                       RETURNING id""",
+                    f"PDF uploads: {book['code_name']}",
+                    code_book_id,
+                )
+
+            # One canonical import_logs row that the background parser
+            # will keep updating as it progresses.
             import_log_id = await conn.fetchval(
-                """INSERT INTO import_logs (source_id, status, imported_at)
-                   VALUES ($1, $2, $3) RETURNING id""",
-                1, "running", datetime.utcnow(),
+                """INSERT INTO import_logs
+                       (source_id, code_book_id, pdf_id, filename,
+                        status, phase, imported_at, updated_at)
+                   VALUES ($1, $2, $3, $4, 'processing', 'queued', NOW(), NOW())
+                   RETURNING id""",
+                source_id, code_book_id, pdf_id, safe_name,
             )
 
         # Drop the local buffer before kicking off the parser so we don't
         # hold the full PDF in memory through the async task.
         del pdf_bytes
 
-        # Start parse+index in background. The parser reads from the temp
-        # file on disk; the canonical copy now lives in Postgres.
+        # Start parse+index in background; pass the log_id so progress
+        # lands on the same row the upload endpoint just created.
         asyncio.create_task(
             import_svc.import_pdf(
                 file_path=temp_file_path,
                 code_book_id=code_book_id,
                 db_pool=db_pool,
                 embedding_url=EMBEDDING_SERVICE_URL,
-                source_id=1,
+                source_id=source_id,
+                import_log_id=import_log_id,
             )
         )
 
         logger.info(
-            "PDF upload persisted: pdf_id=%s book=%s import_log_id=%s",
-            pdf_id, book["code_name"], import_log_id,
+            "PDF upload persisted: pdf_id=%s book=%s import_log_id=%s size=%.1fMB",
+            pdf_id, book["code_name"], import_log_id, size / (1024 * 1024),
         )
         return ImportUploadResponse(
             filename=safe_name,
@@ -1155,6 +1181,115 @@ async def scrape_icc_direct(request: ScrapeICCRequest) -> ScrapeResponse:
 
     except Exception as e:
         logger.error(f"ICC scrape error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/imports")
+async def get_imports(limit: int = Query(20, ge=1, le=100)):
+    """Recent + active imports with joined metadata for the dashboard.
+
+    Each row represents one import_logs entry — either a PDF upload or a
+    scraper run — with the code book it targets and (for uploads) the
+    stored PDF id so the UI can link back to the binary. Ordered by most
+    recent activity first.
+    """
+    try:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT il.id, il.source_id, il.status, il.phase,
+                       il.code_book_id, il.pdf_id, il.filename,
+                       il.records_total, il.records_processed,
+                       il.records_imported, il.records_failed,
+                       il.error_message, il.imported_at, il.updated_at,
+                       il.completed_at,
+                       cb.code_name AS book_name,
+                       cb.abbreviation AS book_abbreviation,
+                       cb.part_number AS book_part_number,
+                       cbp.size_bytes AS pdf_size_bytes,
+                       isrc.source_type
+                  FROM import_logs il
+                  LEFT JOIN code_books cb ON cb.id = il.code_book_id
+                  LEFT JOIN code_book_pdfs cbp ON cbp.id = il.pdf_id
+                  LEFT JOIN import_sources isrc ON isrc.id = il.source_id
+                 ORDER BY COALESCE(il.updated_at, il.imported_at) DESC
+                 LIMIT $1
+                """,
+                limit,
+            )
+
+            out = []
+            for r in rows:
+                total = r["records_total"] or 0
+                processed = r["records_processed"] or 0
+                pct = int(100 * processed / total) if total else None
+                out.append({
+                    "id": r["id"],
+                    "source_id": r["source_id"],
+                    "source_type": r["source_type"],
+                    "status": r["status"],
+                    "phase": r["phase"] or "queued",
+                    "code_book_id": r["code_book_id"],
+                    "book_name": r["book_name"],
+                    "book_abbreviation": r["book_abbreviation"],
+                    "book_part_number": r["book_part_number"],
+                    "pdf_id": r["pdf_id"],
+                    "pdf_size_bytes": r["pdf_size_bytes"],
+                    "filename": r["filename"],
+                    "records_total": total or None,
+                    "records_processed": processed,
+                    "records_imported": r["records_imported"] or 0,
+                    "records_failed": r["records_failed"] or 0,
+                    "percent": pct,
+                    "error_message": r["error_message"],
+                    "imported_at": r["imported_at"].isoformat() if r["imported_at"] else None,
+                    "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
+                    "completed_at": r["completed_at"].isoformat() if r["completed_at"] else None,
+                })
+            return out
+    except Exception as e:
+        logger.error(f"Imports list error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/imports/{import_log_id}")
+async def get_import(import_log_id: int):
+    """Single import log row for progress polling after an upload."""
+    try:
+        async with db_pool.acquire() as conn:
+            r = await conn.fetchrow(
+                """SELECT il.*, cb.code_name AS book_name
+                   FROM import_logs il
+                   LEFT JOIN code_books cb ON cb.id = il.code_book_id
+                   WHERE il.id = $1""",
+                import_log_id,
+            )
+        if not r:
+            raise HTTPException(status_code=404, detail="import not found")
+        total = r["records_total"] or 0
+        processed = r["records_processed"] or 0
+        return {
+            "id": r["id"],
+            "status": r["status"],
+            "phase": r["phase"] or "queued",
+            "code_book_id": r["code_book_id"],
+            "book_name": r["book_name"],
+            "pdf_id": r["pdf_id"],
+            "filename": r["filename"],
+            "records_total": total or None,
+            "records_processed": processed,
+            "records_imported": r["records_imported"] or 0,
+            "records_failed": r["records_failed"] or 0,
+            "percent": int(100 * processed / total) if total else None,
+            "error_message": r["error_message"],
+            "imported_at": r["imported_at"].isoformat() if r["imported_at"] else None,
+            "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
+            "completed_at": r["completed_at"].isoformat() if r["completed_at"] else None,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Import detail error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

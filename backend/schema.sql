@@ -165,11 +165,19 @@ CREATE TABLE IF NOT EXISTS import_logs (
     id SERIAL PRIMARY KEY,
     source_id INTEGER NOT NULL REFERENCES import_sources(id) ON DELETE CASCADE,
     status VARCHAR(100),
+    -- Direct attribution (nullable when this is a scraper run rather than a PDF upload).
+    code_book_id INTEGER REFERENCES code_books(id) ON DELETE SET NULL,
+    pdf_id INTEGER REFERENCES code_book_pdfs(id) ON DELETE SET NULL,
+    filename VARCHAR(500),
+    -- Coarse-grained phase the worker is in: queued | parsing | indexing | completed | failed
+    phase VARCHAR(50) DEFAULT 'queued',
+    records_total INTEGER,
     records_processed INTEGER DEFAULT 0,
     records_imported INTEGER DEFAULT 0,
     records_failed INTEGER DEFAULT 0,
     error_message TEXT,
     imported_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
     completed_at TIMESTAMP
 );
 

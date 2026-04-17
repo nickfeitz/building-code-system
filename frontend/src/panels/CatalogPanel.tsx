@@ -1,7 +1,8 @@
 import { useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useCatalog, useCatalogScan } from "../hooks/useCatalog";
-import { uploadPdf, ApiError } from "../api/client";
+import { uploadPdf, ApiError, type UploadProgress } from "../api/client";
+import { ProgressBar } from "../components/ImportsTable";
 import type {
   CatalogAuthority,
   CatalogBook,
@@ -52,6 +53,7 @@ function BookRow({
   const qc = useQueryClient();
   const fileInput = useRef<HTMLInputElement>(null);
   const [uploading, setUploading] = useState(false);
+  const [progress, setProgress] = useState<UploadProgress | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
 
   const onPickFile = () => fileInput.current?.click();
@@ -62,10 +64,12 @@ function BookRow({
     if (!f) return;
     setUploading(true);
     setMsg(null);
+    setProgress({ loaded: 0, total: f.size, fraction: 0, bytesPerSec: 0, elapsedMs: 0 });
     try {
-      const r = await uploadPdf(book.id, f);
-      setMsg(`Uploaded ${r.filename} · processing…`);
-      qc.invalidateQueries({ queryKey: ["import-status"] });
+      const r = await uploadPdf(book.id, f, setProgress);
+      setMsg(`Uploaded ${r.filename} · processing (watch Import panel)…`);
+      setProgress(null);
+      qc.invalidateQueries({ queryKey: ["imports"] });
       qc.invalidateQueries({ queryKey: ["catalog"] });
       qc.invalidateQueries({ queryKey: ["stats"] });
     } catch (err) {
@@ -74,6 +78,7 @@ function BookRow({
           ? `Upload failed (${err.status}): ${err.message}`
           : String(err)
       );
+      setProgress(null);
     } finally {
       setUploading(false);
     }
@@ -124,6 +129,21 @@ function BookRow({
             </span>
           )}
         </div>
+        {progress && (
+          <div className="mt-1.5">
+            <ProgressBar
+              percent={progress.total ? Math.round(progress.fraction * 100) : null}
+              phase="indexing"
+            />
+            <div className="text-[10px] text-surface-100 mt-0.5">
+              {progress.total
+                ? `${Math.round(progress.fraction * 100)}% · ${(progress.loaded / 1024 / 1024).toFixed(1)} / ${(progress.total / 1024 / 1024).toFixed(1)} MB`
+                : "uploading…"}
+              {progress.bytesPerSec > 0 &&
+                ` · ${(progress.bytesPerSec / 1024 / 1024).toFixed(1)} MB/s`}
+            </div>
+          </div>
+        )}
       </div>
       <input
         ref={fileInput}

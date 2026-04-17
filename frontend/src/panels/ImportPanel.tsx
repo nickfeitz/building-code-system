@@ -1,8 +1,10 @@
-import { useMemo, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
-import { apiGet, uploadPdf, ApiError } from "../api/client";
-import type { ImportStatusItem, CatalogBook, CatalogResponse } from "../api/types";
+import { useMemo, useRef, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
+import { uploadPdf, ApiError, type UploadProgress } from "../api/client";
+import type { CatalogBook, CatalogResponse } from "../api/types";
 import { useCatalog } from "../hooks/useCatalog";
+import { useImports } from "../hooks/useImports";
+import { ImportsTable, ProgressBar } from "../components/ImportsTable";
 
 /** Compact picker rendering the catalog as an optgroup-free searchable list. */
 function BookPicker({
@@ -39,7 +41,6 @@ function BookPicker({
     });
   }, [flat, q]);
 
-  // Group filtered results by authority for display
   const grouped = useMemo(() => {
     const m = new Map<string, typeof filtered>();
     for (const item of filtered) {
@@ -127,29 +128,55 @@ function BookPicker({
   );
 }
 
+function formatBytes(n: number): string {
+  const u = ["B", "KB", "MB", "GB"];
+  let v = n;
+  let i = 0;
+  while (v >= 1024 && i < u.length - 1) {
+    v /= 1024;
+    i++;
+  }
+  return `${v.toFixed(v >= 10 ? 0 : 1)} ${u[i]}`;
+}
+
+function formatRate(bps: number): string {
+  return `${formatBytes(bps)}/s`;
+}
+
+function etaSeconds(p: UploadProgress): number | null {
+  if (!p.total || p.bytesPerSec <= 0) return null;
+  return Math.max(0, (p.total - p.loaded) / p.bytesPerSec);
+}
+
 export function ImportPanel() {
   const catalog = useCatalog();
+  const imports = useImports(25);
+  const qc = useQueryClient();
+
   const [book, setBook] = useState<CatalogBook | null>(null);
   const [file, setFile] = useState<File | null>(null);
   const [busy, setBusy] = useState(false);
+  const [progress, setProgress] = useState<UploadProgress | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
-
-  const status = useQuery({
-    queryKey: ["import-status"],
-    queryFn: () => apiGet<ImportStatusItem[]>("/import/status"),
-    refetchInterval: 5_000,
-  });
+  const abortRef = useRef<(() => void) | null>(null);
 
   const upload = async () => {
     if (!file || !book) return;
     setBusy(true);
     setMsg(null);
+    setProgress({ loaded: 0, total: file.size, fraction: 0, bytesPerSec: 0, elapsedMs: 0 });
+    const handle = uploadPdf(book.id, file, setProgress);
+    abortRef.current = handle.abort;
     try {
-      const r = await uploadPdf(book.id, file);
+      const r = await handle;
       setMsg(
-        `Uploaded ${r.filename} → ${book.code_name}. Processing started (import_log_id=${r.import_log_id}).`
+        `Uploaded ${r.filename} → ${book.code_name}. Server queued import_log_id=${r.import_log_id}; watch its progress below.`
       );
       setFile(null);
+      setProgress(null);
+      qc.invalidateQueries({ queryKey: ["imports"] });
+      qc.invalidateQueries({ queryKey: ["catalog"] });
+      qc.invalidateQueries({ queryKey: ["stats"] });
     } catch (e) {
       setMsg(
         e instanceof ApiError
@@ -158,16 +185,21 @@ export function ImportPanel() {
       );
     } finally {
       setBusy(false);
+      abortRef.current = null;
     }
   };
+
+  const cancel = () => abortRef.current?.();
 
   return (
     <div className="h-full overflow-y-auto p-6 space-y-6">
       <div className="card">
         <h2 className="text-sm font-semibold text-white mb-3">Upload PDF</h2>
         <p className="text-xs text-surface-100 mb-3">
-          Pick the code this PDF is for, then choose a file. The parsed sections
-          will be linked to that book and indexed for chat + browse.
+          Pick the code this PDF is for, then choose a file. The PDF is stored
+          in Postgres and the parsed sections are linked to that book + indexed
+          for chat and browse. Watch the progress below during both upload and
+          server-side processing.
         </p>
 
         <div className="space-y-3">
@@ -187,13 +219,19 @@ export function ImportPanel() {
           </div>
 
           <div className="flex items-center gap-3">
-            <button
-              onClick={upload}
-              disabled={!file || !book || busy}
-              className="btn-primary"
-            >
-              {busy ? "Uploading…" : "Upload"}
-            </button>
+            {busy ? (
+              <button type="button" onClick={cancel} className="btn-ghost">
+                Cancel upload
+              </button>
+            ) : (
+              <button
+                onClick={upload}
+                disabled={!file || !book}
+                className="btn-primary"
+              >
+                Upload
+              </button>
+            )}
             {book && (
               <div className="text-xs text-surface-100">
                 → {book.code_name}
@@ -201,31 +239,36 @@ export function ImportPanel() {
               </div>
             )}
           </div>
+
+          {progress && (
+            <div className="space-y-1 mt-2">
+              <ProgressBar percent={Math.round(progress.fraction * 100)} phase="indexing" />
+              <div className="flex items-center justify-between text-xs text-surface-100">
+                <span>
+                  {formatBytes(progress.loaded)}
+                  {progress.total ? ` / ${formatBytes(progress.total)}` : ""}
+                  {progress.total ? ` · ${Math.round(progress.fraction * 100)}%` : ""}
+                </span>
+                <span>
+                  {formatRate(progress.bytesPerSec)}
+                  {etaSeconds(progress) != null &&
+                    ` · ETA ${Math.round(etaSeconds(progress)!)}s`}
+                </span>
+              </div>
+            </div>
+          )}
           {msg && <div className="text-xs text-surface-50">{msg}</div>}
         </div>
       </div>
 
       <div className="card">
-        <h2 className="text-sm font-semibold text-white mb-3">Recent Imports</h2>
-        {status.isLoading && <div className="text-xs text-surface-100">loading…</div>}
-        {status.data && status.data.length === 0 && (
-          <div className="text-xs text-surface-100">No imports yet.</div>
-        )}
-        <div className="divide-y divide-surface-500">
-          {(status.data ?? []).map((it) => (
-            <div key={it.id} className="py-2 flex items-center justify-between text-sm">
-              <div className="min-w-0">
-                <div className="text-white truncate">
-                  {it.source_name ?? `import #${it.id}`}
-                </div>
-                {it.message && (
-                  <div className="text-xs text-surface-100">{it.message}</div>
-                )}
-              </div>
-              <div className="text-xs text-surface-100 shrink-0">{it.status}</div>
-            </div>
-          ))}
+        <div className="flex items-center justify-between mb-3">
+          <h2 className="text-sm font-semibold text-white">Recent Imports</h2>
+          <span className="text-xs text-surface-100">
+            auto-refreshing · 2 s while active
+          </span>
         </div>
+        <ImportsTable rows={imports.data} />
       </div>
     </div>
   );

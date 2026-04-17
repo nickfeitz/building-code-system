@@ -127,3 +127,37 @@ export interface CatalogScanResponse {
   }[];
   errors: { code_book_id: number; error: string }[];
 }
+
+// --- Imports (progress tracking) -------------------------------------------
+
+export type ImportPhase =
+  | "queued"
+  | "parsing"
+  | "indexing"
+  | "completed"
+  | "failed"
+  | string;
+
+export interface ImportJob {
+  id: number;
+  source_id: number;
+  source_type: string | null;
+  status: string;
+  phase: ImportPhase;
+  code_book_id: number | null;
+  book_name: string | null;
+  book_abbreviation: string | null;
+  book_part_number: string | null;
+  pdf_id: number | null;
+  pdf_size_bytes: number | null;
+  filename: string | null;
+  records_total: number | null;
+  records_processed: number;
+  records_imported: number;
+  records_failed: number;
+  percent: number | null;
+  error_message: string | null;
+  imported_at: string | null;
+  updated_at: string | null;
+  completed_at: string | null;
+}

@@ -1,5 +1,7 @@
 import { useHealth } from "../hooks/useHealth";
 import { useStats, useLLMStatus } from "../hooks/useStats";
+import { useImports } from "../hooks/useImports";
+import { ImportsTable } from "../components/ImportsTable";
 
 function StatCard({ label, value, hint }: { label: string; value: React.ReactNode; hint?: string }) {
   return (
@@ -37,6 +39,9 @@ export function DashboardPanel() {
   const health = useHealth();
   const stats = useStats();
   const llm = useLLMStatus();
+  const imports = useImports(8);
+  const activePhases = new Set(["queued", "parsing", "indexing"]);
+  const activeCount = (imports.data ?? []).filter((r) => activePhases.has(r.phase)).length;
 
   const dbOk = health.data?.database === "ok";
   const embedOk = health.data?.embedding_service === "ok";
@@ -122,9 +127,27 @@ export function DashboardPanel() {
         </div>
       </div>
 
+      {/* Imports */}
+      <div className="card">
+        <div className="flex items-center justify-between mb-3">
+          <h2 className="text-sm font-semibold text-white">
+            Imports
+            {activeCount > 0 && (
+              <span className="ml-2 badge bg-accent/30 text-accent animate-pulse">
+                {activeCount} active
+              </span>
+            )}
+          </h2>
+          <span className="text-xs text-surface-100">
+            latest 8 · refresh 2 s while active, 10 s idle
+          </span>
+        </div>
+        <ImportsTable rows={imports.data} compact emptyMessage="No uploads or scans yet. Use the Import or Catalog panel to get started." />
+      </div>
+
       {/* Footer: refresh hint */}
       <div className="text-xs text-surface-100 text-center">
-        Auto-refreshing: health every 5s, stats every 10s, LLM every 15s
+        Auto-refreshing: health 5s, stats 10s, LLM 15s, imports 2–10s
       </div>
     </div>
   );
