@@ -92,6 +92,9 @@ export interface CatalogBook {
   scan_status: ScanStatus;
   source_id: number | null;
   last_crawled: string | null;
+  /** Most recent uploaded PDF id for this book (drives the Review button). */
+  latest_pdf_id: number | null;
+  latest_pdf_filename: string | null;
 }
 
 export interface CatalogCycle {
@@ -137,6 +140,63 @@ export type ImportPhase =
   | "completed"
   | "failed"
   | string;
+
+// --- Review (image review of parsed pages) --------------------------------
+
+export interface PdfPageMeta {
+  page_count: number;
+  first_width: number;
+  first_height: number;
+  filename: string | null;
+  size_bytes: number;
+}
+
+export interface PageText {
+  page: number;
+  text: string;
+  chars: number;
+}
+
+export interface PageSection {
+  id: number;
+  section_number: string;
+  section_title: string | null;
+  full_text: string;
+  depth: number;
+  page_number: number | null;
+  has_ca_amendment: boolean;
+  amendment_agency: string | null;
+  section_type: string | null;
+}
+
+export type FlagReason =
+  | "text_missing"
+  | "text_wrong"
+  | "layout_broken"
+  | "ocr_needed"
+  | "other";
+
+export interface FlagRequest {
+  pdf_id: number;
+  code_book_id: number;
+  page: number;
+  reason: FlagReason;
+  note?: string;
+}
+
+export interface FlagResponse {
+  quarantine_id: number;
+  source_id: number;
+  page: number;
+  reason: FlagReason;
+}
+
+export interface ReviewContext {
+  pdfId: number;
+  codeBookId: number;
+  codeName: string;
+  filename: string | null;
+}
 
 export interface ImportJob {
   id: number;

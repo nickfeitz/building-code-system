@@ -62,6 +62,11 @@ export interface UploadProgress {
   elapsedMs: number;
 }
 
+/** URL for a rendered PDF page; used as an `<img src>`. */
+export function pdfPageImageUrl(pdfId: number, page: number, dpi: number): string {
+  return `${API_BASE}/code-book-pdfs/${pdfId}/pages/${page}.png?dpi=${dpi}`;
+}
+
 /**
  * Upload a PDF into the given code_book. The backend expects `code_book_id`
  * as a query param (not a form field). Uses XHR so we can report progress

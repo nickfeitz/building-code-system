@@ -69,9 +69,15 @@ CREATE TABLE IF NOT EXISTS code_sections (
     source_hash VARCHAR(64),                      -- SHA-256 for change detection
     last_verified TIMESTAMPTZ,
     embedding vector(1024),                       -- E5-large-v2 = 1024 dims
+    -- 1-based page in the source PDF where this section started; lets the
+    -- image-review UI jump from a section to its rendered page.
+    page_number INTEGER,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE INDEX IF NOT EXISTS idx_code_sections_book_page
+    ON code_sections(code_book_id, page_number);
 
 -- Code Section Versions (audit trail)
 CREATE TABLE IF NOT EXISTS code_section_versions (

@@ -4,10 +4,11 @@ Extracts sections with proper hierarchy detection, amendment annotations,
 and preservation of table structures.
 """
 
+import bisect
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict, Set
+from typing import List, Optional, Dict, Set, Tuple
 import fitz  # PyMuPDF
 
 logger = logging.getLogger(__name__)
@@ -25,6 +26,9 @@ class ParsedSection:
     has_ca_amendment: bool = False
     amendment_agency: Optional[str] = None
     section_type: str = "section"  # 'section', 'table', 'figure', 'appendix', 'definition'
+    # 1-based page in the source PDF where this section starts. Sections
+    # that span pages are attributed to their starting page only.
+    page_number: Optional[int] = None
 
 
 class PDFParser:
@@ -70,8 +74,9 @@ class PDFParser:
         try:
             with fitz.open(pdf_path) as doc:
                 logger.info(f"Parsing PDF: {pdf_path} ({len(doc)} pages)")
-                full_text = self._extract_full_text(doc)
-                self._extract_sections(full_text, doc)
+                full_text, page_line_starts = self._extract_full_text(doc)
+                self._page_count = len(doc)
+                self._extract_sections(full_text, doc, page_line_starts)
 
         except Exception as e:
             logger.error(f"Error parsing PDF {pdf_path}: {e}", exc_info=True)
@@ -79,45 +84,86 @@ class PDFParser:
 
         return self.sections
 
-    def _extract_full_text(self, doc: fitz.Document) -> str:
+    def _extract_full_text(self, doc: fitz.Document) -> Tuple[str, List[int]]:
         """Extract full text from PDF, skipping headers/footers.
 
-        Args:
-            doc: PyMuPDF document
-
         Returns:
-            Full text content
-        """
-        full_text = []
+            ``(joined_text, page_line_starts)`` where ``joined_text`` is the
+            concatenation of each page's filtered lines, joined with ``'\\n'``,
+            and ``page_line_starts[i]`` is the 0-based line index at which
+            page ``i+1`` begins in ``joined_text.split('\\n')``.
 
-        for page_num, page in enumerate(doc):
+            Callers split ``joined_text`` on ``'\\n'``; a section detected
+            at line index ``L`` lives on page
+            ``bisect_right(page_line_starts, L)`` (1-based).
+        """
+        per_page_lines: List[List[str]] = []
+
+        for _page_num, page in enumerate(doc):
             text = page.get_text()
 
             # Remove common headers/footers (simplified approach)
-            lines = text.split('\n')
-            content_lines = []
-
-            for line in lines:
-                # Skip page numbers, common header patterns
+            content_lines: List[str] = []
+            for line in text.split('\n'):
                 if (line.strip() and
                     not re.match(r'^\s*\d+\s*$', line) and
                     not re.match(r'^\s*[A-Z\s]+\s*\|\s*\d{4}', line)):
                     content_lines.append(line)
+            per_page_lines.append(content_lines)
 
-            full_text.append('\n'.join(content_lines))
+        # Build the joined text the same way the consumer will split it.
+        # We join each page with '\n' within the page, and '\n' between
+        # pages, which means the page boundary sits exactly at the next
+        # line index after the last line of the previous page.
+        joined_per_page = ['\n'.join(lines) for lines in per_page_lines]
+        joined = '\n'.join(joined_per_page)
 
-        return '\n'.join(full_text)
+        # Derive offsets from the final split — this is the source of truth
+        # and keeps the attribution robust to any future edits above.
+        all_lines = joined.split('\n')
+        page_line_starts: List[int] = []
+        cursor = 0
+        for i, page_block in enumerate(joined_per_page):
+            page_line_starts.append(cursor)
+            if i < len(joined_per_page) - 1:
+                # Each joined_per_page[i] contributes exactly (count('\n')+1)
+                # lines to the final split. The '\n' that `'\n'.join`
+                # inserts between pages is also a split boundary, so the
+                # next page's first line is at cursor + contributed.
+                contributed = page_block.count('\n') + 1
+                cursor += contributed
+        # Sanity: the final cursor should be <= len(all_lines)
+        assert cursor <= len(all_lines), (
+            f"page_line_starts accounting drifted: cursor={cursor} vs {len(all_lines)} lines"
+        )
+        return joined, page_line_starts
 
-    def _extract_sections(self, full_text: str, doc: fitz.Document) -> None:
+    def _extract_sections(
+        self,
+        full_text: str,
+        doc: fitz.Document,
+        page_line_starts: Optional[List[int]] = None,
+    ) -> None:
         """Extract sections from full text with hierarchy.
 
         Args:
             full_text: Full text content from PDF
             doc: PyMuPDF document for font analysis
+            page_line_starts: 0-based line indices where each page begins
+                in ``full_text.split('\\n')``. When provided, each section
+                is stamped with the 1-based page number it started on.
         """
         lines = full_text.split('\n')
         current_section = None
         current_text_buffer = []
+
+        def page_for(line_idx: int) -> Optional[int]:
+            if not page_line_starts:
+                return None
+            # bisect_right returns the 1-based page index directly:
+            # page_line_starts[p-1] <= line_idx < page_line_starts[p]
+            p = bisect.bisect_right(page_line_starts, line_idx)
+            return p if p >= 1 else 1
 
         for line_idx, line in enumerate(lines):
             line_stripped = line.strip()
@@ -150,6 +196,7 @@ class PDFParser:
                     'title': section_title,
                     'has_amendment': False,
                     'amendment_agency': None,
+                    'page_number': page_for(line_idx),
                 }
                 current_text_buffer = [line]
                 continue
@@ -233,6 +280,17 @@ class PDFParser:
         # Detect section type
         section_type = self._detect_section_type(full_text)
 
+        page_number = section_info.get('page_number')
+        if page_number is not None and hasattr(self, '_page_count'):
+            # Defensive clamp: bisect should never exceed range, but a
+            # wrong page_number would silently mislead the review UI.
+            if page_number < 1 or page_number > self._page_count:
+                logger.warning(
+                    "page_number %s out of range [1, %s] for section %s — dropping",
+                    page_number, self._page_count, section_num,
+                )
+                page_number = None
+
         parsed = ParsedSection(
             section_number=section_num,
             section_title=section_title or f"Section {section_num}",
@@ -243,6 +301,7 @@ class PDFParser:
             has_ca_amendment=section_info['has_amendment'],
             amendment_agency=section_info['amendment_agency'],
             section_type=section_type,
+            page_number=page_number,
         )
 
         self.sections.append(parsed)

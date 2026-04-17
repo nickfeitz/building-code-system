@@ -1082,6 +1082,268 @@ async def download_book_pdf(pdf_id: int):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# --- Image review: render PDF pages on demand -----------------------------
+#
+# All three review endpoints open the stored bytes with PyMuPDF. Rendering
+# is CPU-bound and blocking, so we wrap the fitz calls in
+# asyncio.to_thread() to keep the event loop responsive.
+
+async def _fetch_pdf_bytes(pdf_id: int) -> tuple[bytes, str | None]:
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT filename, content, size_bytes FROM code_book_pdfs WHERE id = $1",
+            pdf_id,
+        )
+    if not row:
+        raise HTTPException(status_code=404, detail="PDF not found")
+    return bytes(row["content"]), row["filename"]
+
+
+@app.get("/api/code-book-pdfs/{pdf_id}/pages")
+async def pdf_meta(pdf_id: int):
+    """Return per-PDF metadata used by the review UI before it starts rendering."""
+    try:
+        pdf_bytes, filename = await _fetch_pdf_bytes(pdf_id)
+
+        def inspect() -> dict:
+            import fitz  # local import to keep cold start of main.py light
+            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            try:
+                n = doc.page_count
+                first = doc[0] if n > 0 else None
+                w = first.rect.width if first else 0
+                h = first.rect.height if first else 0
+                return {"page_count": n, "first_width": w, "first_height": h}
+            finally:
+                doc.close()
+
+        meta = await asyncio.to_thread(inspect)
+        meta["filename"] = filename
+        meta["size_bytes"] = len(pdf_bytes)
+        return meta
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"PDF meta error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/code-book-pdfs/{pdf_id}/pages/{page}.png")
+async def pdf_page_png(pdf_id: int, page: int, dpi: int = Query(150, ge=72, le=300)):
+    """Render a single PDF page to PNG on demand."""
+    try:
+        pdf_bytes, _ = await _fetch_pdf_bytes(pdf_id)
+
+        def render() -> bytes:
+            import fitz
+            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            try:
+                if page < 1 or page > doc.page_count:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"page {page} out of range (1..{doc.page_count})",
+                    )
+                pix = doc[page - 1].get_pixmap(dpi=dpi)
+                return pix.tobytes("png")
+            finally:
+                doc.close()
+
+        png = await asyncio.to_thread(render)
+        return Response(
+            content=png,
+            media_type="image/png",
+            headers={
+                # Cache-key effectively includes (pdf_id, page, dpi) via URL —
+                # safe to instruct the browser to cache for an hour.
+                "Cache-Control": "public, max-age=3600",
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"PDF page render error (pdf={pdf_id}, page={page}): {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/code-book-pdfs/{pdf_id}/pages/{page}/text")
+async def pdf_page_text(pdf_id: int, page: int):
+    """Return the raw PyMuPDF text for a single page (pre-filter)."""
+    try:
+        pdf_bytes, _ = await _fetch_pdf_bytes(pdf_id)
+
+        def extract() -> str:
+            import fitz
+            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            try:
+                if page < 1 or page > doc.page_count:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"page {page} out of range (1..{doc.page_count})",
+                    )
+                return doc[page - 1].get_text()
+            finally:
+                doc.close()
+
+        text = await asyncio.to_thread(extract)
+        return {"page": page, "text": text, "chars": len(text)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"PDF page text error (pdf={pdf_id}, page={page}): {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/code-books/{book_id}/sections")
+async def list_book_sections(
+    book_id: int,
+    page: int | None = Query(None, description="Filter to sections on a specific page"),
+    limit: int = Query(50, ge=1, le=500),
+):
+    """List sections for a code book, optionally filtered by source page.
+
+    Used by the review UI's "Sections on this page" pane. Returns empty
+    when ``page`` is provided but no sections were attributed to it
+    (common for older imports that predate page_number tracking).
+    """
+    try:
+        async with db_pool.acquire() as conn:
+            if page is not None:
+                rows = await conn.fetch(
+                    """SELECT id, section_number, section_title, full_text,
+                              depth, page_number, has_ca_amendment, amendment_agency,
+                              section_type
+                         FROM code_sections
+                        WHERE code_book_id = $1 AND page_number = $2
+                        ORDER BY display_order NULLS LAST, id
+                        LIMIT $3""",
+                    book_id, page, limit,
+                )
+            else:
+                rows = await conn.fetch(
+                    """SELECT id, section_number, section_title, full_text,
+                              depth, page_number, has_ca_amendment, amendment_agency,
+                              section_type
+                         FROM code_sections
+                        WHERE code_book_id = $1
+                        ORDER BY display_order NULLS LAST, id
+                        LIMIT $2""",
+                    book_id, limit,
+                )
+        return [
+            {
+                "id": r["id"],
+                "section_number": r["section_number"],
+                "section_title": r["section_title"],
+                "full_text": r["full_text"],
+                "depth": r["depth"],
+                "page_number": r["page_number"],
+                "has_ca_amendment": r["has_ca_amendment"],
+                "amendment_agency": r["amendment_agency"],
+                "section_type": r["section_type"],
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        logger.error(f"List sections error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class FlagPageRequest(BaseModel):
+    pdf_id: int
+    code_book_id: int
+    page: int
+    reason: str  # text_missing | text_wrong | layout_broken | ocr_needed | other
+    note: Optional[str] = None
+
+
+@app.post("/api/review/flag")
+async def flag_page(req: FlagPageRequest):
+    """Route a user-flagged bad extraction into the existing quarantine queue.
+
+    The reviewer flags a specific page; we grab the page's raw PyMuPDF text
+    so Quarantine has the actual content the parser saw, then insert a
+    row with ``validation_layer = 0`` (sentinel for "user-flagged"; the
+    validator itself uses 1..4).
+    """
+    try:
+        # Fetch page text up-front (also validates pdf/page).
+        pdf_bytes, filename = await _fetch_pdf_bytes(req.pdf_id)
+
+        def page_text() -> str:
+            import fitz
+            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            try:
+                if req.page < 1 or req.page > doc.page_count:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"page {req.page} out of range",
+                    )
+                return doc[req.page - 1].get_text()
+            finally:
+                doc.close()
+
+        raw_text = await asyncio.to_thread(page_text)
+
+        # Find-or-create the pdf_parse import source for this book.
+        async with db_pool.acquire() as conn:
+            book = await conn.fetchrow(
+                "SELECT id, code_name FROM code_books WHERE id = $1",
+                req.code_book_id,
+            )
+            if not book:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"code_book {req.code_book_id} not found",
+                )
+            src = await conn.fetchrow(
+                """SELECT id FROM import_sources
+                    WHERE code_book_id = $1 AND source_type = 'pdf_parse'
+                    ORDER BY id DESC LIMIT 1""",
+                req.code_book_id,
+            )
+            if src:
+                source_id = src["id"]
+            else:
+                source_id = await conn.fetchval(
+                    """INSERT INTO import_sources
+                           (source_name, source_type, code_book_id, status)
+                       VALUES ($1, 'pdf_parse', $2, 'pending')
+                       RETURNING id""",
+                    f"PDF uploads: {book['code_name']}",
+                    req.code_book_id,
+                )
+
+            metadata = {
+                "source": "review_ui",
+                "pdf_id": req.pdf_id,
+                "code_book_id": req.code_book_id,
+                "page_number": req.page,
+                "filename": filename,
+                "flagged_at": datetime.utcnow().isoformat() + "Z",
+            }
+            msg = req.reason if not req.note else f"{req.reason} — {req.note}"
+
+            quarantine_id = await conn.fetchval(
+                """INSERT INTO content_quarantine
+                       (source_id, validation_layer, error_message,
+                        raw_content, metadata)
+                   VALUES ($1, 0, $2, $3, $4::jsonb)
+                   RETURNING id""",
+                source_id, msg, raw_text[:5000], json.dumps(metadata),
+            )
+        return {
+            "quarantine_id": quarantine_id,
+            "source_id": source_id,
+            "page": req.page,
+            "reason": req.reason,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Flag page error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/api/import/trigger/{source_id}")
 async def trigger_import(source_id: int):
     """Trigger import for a source (PDF or web scrape)"""
@@ -1444,6 +1706,14 @@ async def get_catalog():
                     FROM import_sources
                     WHERE code_book_id IS NOT NULL
                     ORDER BY code_book_id, last_crawled DESC NULLS LAST, id DESC
+                ),
+                latest_pdf AS (
+                    -- Most recent stored PDF per book so the Catalog UI can
+                    -- show/enable a Review button without a second round-trip.
+                    SELECT DISTINCT ON (code_book_id)
+                        code_book_id, id AS pdf_id, filename, uploaded_at
+                    FROM code_book_pdfs
+                    ORDER BY code_book_id, uploaded_at DESC, id DESC
                 )
                 SELECT
                     po.abbreviation   AS org_abbr,
@@ -1469,12 +1739,15 @@ async def get_catalog():
                     li.source_id,
                     li.status         AS import_status,
                     li.last_crawled,
-                    li.sections_imported
+                    li.sections_imported,
+                    lp.pdf_id         AS latest_pdf_id,
+                    lp.filename       AS latest_pdf_filename
                 FROM code_books cb
                 JOIN code_cycles cc ON cc.id = cb.cycle_id
                 JOIN publishing_orgs po ON po.id = cb.publishing_org_id
                 LEFT JOIN section_counts sc ON sc.code_book_id = cb.id
                 LEFT JOIN latest_import li ON li.code_book_id = cb.id
+                LEFT JOIN latest_pdf lp ON lp.code_book_id = cb.id
                 ORDER BY cc.adopting_authority, cc.effective_date DESC,
                          cb.part_number NULLS LAST, cb.abbreviation
                 """
@@ -1529,6 +1802,8 @@ async def get_catalog():
                     "scan_status": scan_status,
                     "source_id": r["source_id"],
                     "last_crawled": r["last_crawled"].isoformat() if r["last_crawled"] else None,
+                    "latest_pdf_id": r["latest_pdf_id"],
+                    "latest_pdf_filename": r["latest_pdf_filename"],
                 })
 
             # Flatten dicts → lists, preserving insertion order (Python 3.7+).

@@ -8,6 +8,7 @@ import type {
   CatalogBook,
   CatalogCycle,
   CatalogScanResponse,
+  ReviewContext,
 } from "../api/types";
 
 type StatusFilter = "all" | "active" | "superseded";
@@ -44,10 +45,12 @@ function BookRow({
   book,
   checked,
   onToggle,
+  onReview,
 }: {
   book: CatalogBook;
   checked: boolean;
   onToggle: () => void;
+  onReview?: (ctx: ReviewContext) => void;
 }) {
   const scannable = !!book.digital_access_url;
   const qc = useQueryClient();
@@ -152,6 +155,23 @@ function BookRow({
         className="hidden"
         onChange={onFile}
       />
+      {onReview && book.latest_pdf_id != null && (
+        <button
+          type="button"
+          onClick={() =>
+            onReview({
+              pdfId: book.latest_pdf_id!,
+              codeBookId: book.id,
+              codeName: book.code_name,
+              filename: book.latest_pdf_filename,
+            })
+          }
+          title={`Review the rendered pages of ${book.latest_pdf_filename ?? "uploaded PDF"} alongside the extracted text`}
+          className="btn-ghost !py-1 !px-2 !text-xs shrink-0"
+        >
+          👁 Review
+        </button>
+      )}
       <button
         type="button"
         onClick={onPickFile}
@@ -170,11 +190,13 @@ function CycleGroup({
   selected,
   toggle,
   toggleAll,
+  onReview,
 }: {
   cycle: CatalogCycle;
   selected: Set<number>;
   toggle: (id: number) => void;
   toggleAll: (bookIds: number[], makeChecked: boolean) => void;
+  onReview?: (ctx: ReviewContext) => void;
 }) {
   const scannableIds = cycle.books.filter((b) => !!b.digital_access_url).map((b) => b.id);
   const allChecked = scannableIds.length > 0 && scannableIds.every((id) => selected.has(id));
@@ -213,7 +235,13 @@ function CycleGroup({
       </summary>
       <div className="pl-4 border-l border-surface-400 ml-3 mt-1 space-y-0.5">
         {cycle.books.map((b) => (
-          <BookRow key={b.id} book={b} checked={selected.has(b.id)} onToggle={() => toggle(b.id)} />
+          <BookRow
+            key={b.id}
+            book={b}
+            checked={selected.has(b.id)}
+            onToggle={() => toggle(b.id)}
+            onReview={onReview}
+          />
         ))}
       </div>
     </details>
@@ -228,6 +256,7 @@ function AuthorityGroup({
   statusFilter,
   scanFilter,
   search,
+  onReview,
 }: {
   authority: CatalogAuthority;
   selected: Set<number>;
@@ -236,6 +265,7 @@ function AuthorityGroup({
   statusFilter: StatusFilter;
   scanFilter: ScanFilter;
   search: string;
+  onReview?: (ctx: ReviewContext) => void;
 }) {
   const filteredCycles = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -279,6 +309,7 @@ function AuthorityGroup({
             selected={selected}
             toggle={toggle}
             toggleAll={toggleAll}
+            onReview={onReview}
           />
         ))}
       </div>
@@ -286,7 +317,11 @@ function AuthorityGroup({
   );
 }
 
-export function CatalogPanel() {
+export function CatalogPanel({
+  onReview,
+}: {
+  onReview?: (ctx: ReviewContext) => void;
+} = {}) {
   const { data, isLoading, error } = useCatalog();
   const scan = useCatalogScan();
 
@@ -441,6 +476,7 @@ export function CatalogPanel() {
             statusFilter={statusFilter}
             scanFilter={scanFilter}
             search={search}
+            onReview={onReview}
           />
         ))}
       </div>

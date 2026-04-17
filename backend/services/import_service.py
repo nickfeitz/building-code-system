@@ -149,8 +149,8 @@ async def import_pdf(
                         '''INSERT INTO code_sections
                            (code_book_id, chapter, section_number, section_title,
                             full_text, section_type, depth, path, has_ca_amendment,
-                            amendment_agency, source_hash)
-                           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                            amendment_agency, source_hash, page_number)
+                           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
                            RETURNING id''',
                         code_book_id,
                         section.chapter,
@@ -163,6 +163,7 @@ async def import_pdf(
                         section.has_ca_amendment,
                         section.amendment_agency,
                         section_hash,
+                        section.page_number,
                     )
 
                     # Generate embedding
