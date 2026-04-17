@@ -43,6 +43,26 @@ export async function apiUpload<T>(path: string, formData: FormData): Promise<T>
   return r.json() as Promise<T>;
 }
 
+/**
+ * Upload a PDF into the given code_book. The backend expects `code_book_id`
+ * as a query param (not a form field), hence this specialized helper.
+ */
+export async function uploadPdf(codeBookId: number, file: File): Promise<{
+  filename: string;
+  status: string;
+  import_log_id: number;
+}> {
+  const fd = new FormData();
+  fd.append("file", file);
+  const q = new URLSearchParams({ code_book_id: String(codeBookId) });
+  const r = await fetch(`${API_BASE}/import/upload?${q.toString()}`, {
+    method: "POST",
+    body: fd,
+  });
+  if (!r.ok) throw new ApiError(r.status, await r.text());
+  return r.json();
+}
+
 // Streaming chat: backend returns a plain-text StreamingResponse
 // (chunks of model tokens, no SSE framing). We expose an async iterator.
 export async function* streamChat(

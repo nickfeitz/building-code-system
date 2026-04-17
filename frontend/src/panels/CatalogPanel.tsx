@@ -1,5 +1,7 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { useCatalog, useCatalogScan } from "../hooks/useCatalog";
+import { uploadPdf, ApiError } from "../api/client";
 import type {
   CatalogAuthority,
   CatalogBook,
@@ -47,6 +49,36 @@ function BookRow({
   onToggle: () => void;
 }) {
   const scannable = !!book.digital_access_url;
+  const qc = useQueryClient();
+  const fileInput = useRef<HTMLInputElement>(null);
+  const [uploading, setUploading] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+
+  const onPickFile = () => fileInput.current?.click();
+
+  const onFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const f = e.target.files?.[0];
+    e.target.value = ""; // reset so the same file can be re-picked
+    if (!f) return;
+    setUploading(true);
+    setMsg(null);
+    try {
+      const r = await uploadPdf(book.id, f);
+      setMsg(`Uploaded ${r.filename} · processing…`);
+      qc.invalidateQueries({ queryKey: ["import-status"] });
+      qc.invalidateQueries({ queryKey: ["catalog"] });
+      qc.invalidateQueries({ queryKey: ["stats"] });
+    } catch (err) {
+      setMsg(
+        err instanceof ApiError
+          ? `Upload failed (${err.status}): ${err.message}`
+          : String(err)
+      );
+    } finally {
+      setUploading(false);
+    }
+  };
+
   return (
     <div
       className={`flex items-center gap-3 py-2 px-4 rounded border-l-2 ${
@@ -58,7 +90,7 @@ function BookRow({
         checked={checked}
         onChange={onToggle}
         disabled={!scannable}
-        title={scannable ? "Select for scanning" : "No URL available — add one or upload a PDF"}
+        title={scannable ? "Select for scanning" : "No URL available — use Upload PDF →"}
         className="w-4 h-4 accent-blue-500 disabled:opacity-40 disabled:cursor-not-allowed"
       />
       <div className="flex-1 min-w-0">
@@ -82,8 +114,33 @@ function BookRow({
           {!scannable && (
             <span className="text-xs text-surface-100 italic">no URL</span>
           )}
+          {msg && (
+            <span
+              className={`text-xs ${
+                msg.startsWith("Upload failed") ? "text-danger" : "text-success"
+              }`}
+            >
+              {msg}
+            </span>
+          )}
         </div>
       </div>
+      <input
+        ref={fileInput}
+        type="file"
+        accept=".pdf"
+        className="hidden"
+        onChange={onFile}
+      />
+      <button
+        type="button"
+        onClick={onPickFile}
+        disabled={uploading}
+        title={`Upload a PDF into ${book.code_name}`}
+        className="btn-ghost !py-1 !px-2 !text-xs shrink-0"
+      >
+        {uploading ? "Uploading…" : "Upload PDF"}
+      </button>
     </div>
   );
 }
