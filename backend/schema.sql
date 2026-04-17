@@ -123,6 +123,24 @@ CREATE TABLE IF NOT EXISTS section_topics (
     PRIMARY KEY (section_id, topic_id)
 );
 
+-- Uploaded source PDFs — preserves the original binary per code_book so
+-- parsed content can be re-derived and the original can be retrieved.
+-- content is BYTEA; Postgres caps a single bytea value at ~1 GB.
+CREATE TABLE IF NOT EXISTS code_book_pdfs (
+    id SERIAL PRIMARY KEY,
+    code_book_id INTEGER NOT NULL REFERENCES code_books(id) ON DELETE CASCADE,
+    filename VARCHAR(500),
+    mime_type VARCHAR(100) DEFAULT 'application/pdf',
+    sha256 CHAR(64) NOT NULL,
+    size_bytes BIGINT NOT NULL,
+    content BYTEA NOT NULL,
+    notes TEXT,
+    uploaded_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (code_book_id, sha256)
+);
+
+CREATE INDEX IF NOT EXISTS idx_code_book_pdfs_book ON code_book_pdfs(code_book_id);
+
 -- Import Sources
 CREATE TABLE IF NOT EXISTS import_sources (
     id SERIAL PRIMARY KEY,

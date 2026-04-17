@@ -1,5 +1,6 @@
 import os
 import json
+import hashlib
 import logging
 import asyncio
 import httpx
@@ -9,7 +10,7 @@ from datetime import datetime
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Query
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel
 import uvicorn
 import asyncpg
@@ -889,51 +890,169 @@ async def get_section_graph(section_id: int):
 @app.post("/api/import/upload")
 async def upload_pdf(
     file: UploadFile = File(...),
-    code_book_id: int = Query(1, description="Code book ID to import into")
+    code_book_id: int = Query(1, description="Code book ID to import into"),
 ) -> ImportUploadResponse:
-    """Handle PDF upload and start import pipeline"""
+    """Handle PDF upload: stream to disk, persist to Postgres, kick off parsing.
+
+    Streaming avoids loading the entire file into process memory (important
+    for multi-hundred-MB code PDFs). The bytes are then stored in the
+    code_book_pdfs table keyed by (code_book_id, sha256) so the original
+    survives container restarts and can be retrieved via the download
+    endpoint. If the same (book, sha256) is uploaded again, we reuse the
+    existing row instead of duplicating.
+    """
     try:
         if not pdf_parser:
             raise HTTPException(status_code=503, detail="PDF pipeline not available")
 
-        # Read file contents
-        contents = await file.read()
-
-        # Save to temp directory
-        temp_file_path = os.path.join(PDF_UPLOAD_DIR, file.filename or "upload.pdf")
-        with open(temp_file_path, "wb") as f:
-            f.write(contents)
-
-        # Create import_logs record with 'running' status
+        # Verify the target book exists (and grab its name for logging)
         async with db_pool.acquire() as conn:
-            import_log_id = await conn.fetchval(
-                """INSERT INTO import_logs (source_id, status, imported_at)
-                   VALUES ($1, $2, $3)
-                   RETURNING id""",
-                1, "running", datetime.utcnow()
+            book = await conn.fetchrow(
+                "SELECT id, code_name FROM code_books WHERE id = $1",
+                code_book_id,
+            )
+        if not book:
+            raise HTTPException(
+                status_code=404,
+                detail=f"code_book {code_book_id} not found",
             )
 
-        # Start import in background
+        safe_name = os.path.basename(file.filename or "upload.pdf")
+        temp_file_path = os.path.join(PDF_UPLOAD_DIR, safe_name)
+
+        # Stream request body to disk in 1 MB chunks while computing SHA-256.
+        # Avoids loading 1 GB into process memory.
+        hasher = hashlib.sha256()
+        size = 0
+        CHUNK = 1024 * 1024
+        with open(temp_file_path, "wb") as out:
+            while True:
+                chunk = await file.read(CHUNK)
+                if not chunk:
+                    break
+                out.write(chunk)
+                hasher.update(chunk)
+                size += len(chunk)
+        sha256 = hasher.hexdigest()
+
+        logger.info(
+            "Uploaded PDF on disk: name=%s size=%.1f MB sha256=%s book_id=%s",
+            safe_name, size / (1024 * 1024), sha256, code_book_id,
+        )
+
+        # Persist the bytes to Postgres (dedup on (code_book_id, sha256)).
+        # Read once more from disk into memory for the bytea param; this is
+        # a single short-lived spike per upload.
+        with open(temp_file_path, "rb") as f:
+            pdf_bytes = f.read()
+
+        async with db_pool.acquire() as conn:
+            pdf_id = await conn.fetchval(
+                """
+                INSERT INTO code_book_pdfs
+                    (code_book_id, filename, mime_type, sha256, size_bytes, content)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (code_book_id, sha256)
+                    DO UPDATE SET uploaded_at = NOW(),
+                                  filename = EXCLUDED.filename,
+                                  size_bytes = EXCLUDED.size_bytes
+                RETURNING id
+                """,
+                code_book_id, safe_name, file.content_type or "application/pdf",
+                sha256, size, pdf_bytes,
+            )
+
+            import_log_id = await conn.fetchval(
+                """INSERT INTO import_logs (source_id, status, imported_at)
+                   VALUES ($1, $2, $3) RETURNING id""",
+                1, "running", datetime.utcnow(),
+            )
+
+        # Drop the local buffer before kicking off the parser so we don't
+        # hold the full PDF in memory through the async task.
+        del pdf_bytes
+
+        # Start parse+index in background. The parser reads from the temp
+        # file on disk; the canonical copy now lives in Postgres.
         asyncio.create_task(
             import_svc.import_pdf(
                 file_path=temp_file_path,
                 code_book_id=code_book_id,
                 db_pool=db_pool,
                 embedding_url=EMBEDDING_SERVICE_URL,
-                source_id=1
+                source_id=1,
             )
         )
 
-        logger.info(f"PDF upload started: {file.filename} (import_log_id={import_log_id})")
+        logger.info(
+            "PDF upload persisted: pdf_id=%s book=%s import_log_id=%s",
+            pdf_id, book["code_name"], import_log_id,
+        )
         return ImportUploadResponse(
-            filename=file.filename or "upload.pdf",
+            filename=safe_name,
             status="processing",
-            import_log_id=import_log_id
+            import_log_id=import_log_id,
         )
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Upload error: {e}")
+        logger.exception(f"Upload error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/code-books/{book_id}/pdfs")
+async def list_book_pdfs(book_id: int):
+    """List stored PDFs for a code_book (metadata only; no binary)."""
+    try:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                """SELECT id, filename, mime_type, sha256, size_bytes,
+                          uploaded_at, notes
+                   FROM code_book_pdfs
+                   WHERE code_book_id = $1
+                   ORDER BY uploaded_at DESC""",
+                book_id,
+            )
+            return [
+                {
+                    "id": r["id"],
+                    "filename": r["filename"],
+                    "mime_type": r["mime_type"],
+                    "sha256": r["sha256"],
+                    "size_bytes": r["size_bytes"],
+                    "uploaded_at": r["uploaded_at"].isoformat() if r["uploaded_at"] else None,
+                    "notes": r["notes"],
+                }
+                for r in rows
+            ]
+    except Exception as e:
+        logger.error(f"List PDFs error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/code-book-pdfs/{pdf_id}/content")
+async def download_book_pdf(pdf_id: int):
+    """Stream back a stored PDF by id."""
+    try:
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """SELECT filename, mime_type, content
+                   FROM code_book_pdfs WHERE id = $1""",
+                pdf_id,
+            )
+        if not row:
+            raise HTTPException(status_code=404, detail="PDF not found")
+        return Response(
+            content=bytes(row["content"]),
+            media_type=row["mime_type"] or "application/pdf",
+            headers={
+                "Content-Disposition": f'inline; filename="{row["filename"] or f"{pdf_id}.pdf"}"',
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Download PDF error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
