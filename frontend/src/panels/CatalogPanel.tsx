@@ -1,7 +1,7 @@
 import { useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useCatalog, useCatalogScan } from "../hooks/useCatalog";
-import { uploadPdf, ApiError, type UploadProgress } from "../api/client";
+import { uploadPdf, ApiError, asDuplicate, type UploadProgress } from "../api/client";
 import { ProgressBar } from "../components/ImportsTable";
 import type {
   CatalogAuthority,
@@ -76,11 +76,18 @@ function BookRow({
       qc.invalidateQueries({ queryKey: ["catalog"] });
       qc.invalidateQueries({ queryKey: ["stats"] });
     } catch (err) {
-      setMsg(
-        err instanceof ApiError
-          ? `Upload failed (${err.status}): ${err.message}`
-          : String(err)
-      );
+      const dup = asDuplicate(err);
+      if (dup) {
+        setMsg(
+          `✓ Already uploaded (${dup.current_sections} section${dup.current_sections === 1 ? "" : "s"} indexed)`
+        );
+      } else {
+        setMsg(
+          err instanceof ApiError
+            ? `Upload failed (${err.status}): ${err.message}`
+            : String(err)
+        );
+      }
       setProgress(null);
     } finally {
       setUploading(false);
@@ -125,7 +132,11 @@ function BookRow({
           {msg && (
             <span
               className={`text-xs ${
-                msg.startsWith("Upload failed") ? "text-danger" : "text-success"
+                msg.startsWith("Upload failed")
+                  ? "text-danger"
+                  : msg.startsWith("✓ Already")
+                    ? "text-surface-100"
+                    : "text-success"
               }`}
             >
               {msg}

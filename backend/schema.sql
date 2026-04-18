@@ -72,12 +72,22 @@ CREATE TABLE IF NOT EXISTS code_sections (
     -- 1-based page in the source PDF where this section started; lets the
     -- image-review UI jump from a section to its rendered page.
     page_number INTEGER,
+    -- Which code_book_pdfs row this section was parsed from. When a new PDF
+    -- is uploaded for the same code_book, we stamp superseded_date = today
+    -- on rows with prior source_pdf_id and insert the new ones fresh.
+    source_pdf_id INTEGER REFERENCES code_book_pdfs(id) ON DELETE SET NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX IF NOT EXISTS idx_code_sections_book_page
     ON code_sections(code_book_id, page_number);
+
+-- Fast path for "current sections for book X" — used by search, stats,
+-- catalog counts, chat retrieval, review-by-page. Partial index so it
+-- only spans non-superseded rows.
+CREATE INDEX IF NOT EXISTS idx_code_sections_book_current
+    ON code_sections(code_book_id) WHERE superseded_date IS NULL;
 
 -- Code Section Versions (audit trail)
 CREATE TABLE IF NOT EXISTS code_section_versions (

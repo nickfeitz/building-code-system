@@ -5,15 +5,56 @@ const API_BASE = "/api";
 
 export class ApiError extends Error {
   status: number;
-  constructor(status: number, message: string) {
+  /** Parsed body, when the server sent structured JSON (e.g. 409 dup info). */
+  body: unknown;
+  constructor(status: number, message: string, body?: unknown) {
     super(message);
     this.status = status;
+    this.body = body;
   }
+}
+
+export interface DuplicateUploadDetail {
+  status: "duplicate";
+  message: string;
+  pdf_id: number;
+  filename: string;
+  uploaded_at: string | null;
+  current_sections: number;
+  code_book_id: number;
+  code_name: string;
+}
+
+/** Narrow an ApiError to the 409 duplicate shape if it looks like one. */
+export function asDuplicate(e: unknown): DuplicateUploadDetail | null {
+  if (!(e instanceof ApiError) || e.status !== 409) return null;
+  const b = e.body as { detail?: DuplicateUploadDetail } | null;
+  if (b && b.detail && b.detail.status === "duplicate") return b.detail;
+  return null;
+}
+
+async function failFromResponse(r: Response): Promise<never> {
+  // Preserve the parsed body (typically FastAPI's {"detail": ...}) so
+  // callers can narrow on structured error payloads like 409 duplicate.
+  const text = await r.text();
+  let parsed: unknown = null;
+  try { parsed = JSON.parse(text); } catch { /* leave null */ }
+  const msg =
+    (parsed && typeof parsed === "object" && "detail" in (parsed as object)
+      ? ((parsed as { detail?: unknown }).detail)
+      : null);
+  const message =
+    typeof msg === "string"
+      ? msg
+      : msg && typeof msg === "object" && "message" in (msg as object)
+        ? String((msg as { message?: unknown }).message ?? r.statusText)
+        : text || r.statusText;
+  throw new ApiError(r.status, message, parsed);
 }
 
 export async function apiGet<T>(path: string): Promise<T> {
   const r = await fetch(`${API_BASE}${path}`);
-  if (!r.ok) throw new ApiError(r.status, await r.text());
+  if (!r.ok) await failFromResponse(r);
   return r.json() as Promise<T>;
 }
 
@@ -28,7 +69,7 @@ export async function apiPost<T>(
     body: body ? JSON.stringify(body) : undefined,
     ...init,
   });
-  if (!r.ok) throw new ApiError(r.status, await r.text());
+  if (!r.ok) await failFromResponse(r);
   // Some endpoints return empty bodies
   const text = await r.text();
   return (text ? JSON.parse(text) : (undefined as unknown)) as T;
@@ -111,7 +152,21 @@ export function uploadPdf(
           reject(new ApiError(xhr.status, `invalid JSON: ${String(e)}`));
         }
       } else {
-        reject(new ApiError(xhr.status, xhr.responseText || xhr.statusText));
+        // Preserve the parsed body so callers (Import/Catalog panels) can
+        // distinguish 409 "duplicate" payloads from generic errors.
+        let parsed: unknown = null;
+        try { parsed = JSON.parse(xhr.responseText); } catch { /* leave null */ }
+        const msg =
+          (parsed && typeof parsed === "object" && "detail" in (parsed as object)
+            ? ((parsed as { detail?: unknown }).detail)
+            : null);
+        const text =
+          typeof msg === "string"
+            ? msg
+            : msg && typeof msg === "object" && "message" in (msg as object)
+              ? String((msg as { message?: unknown }).message ?? xhr.statusText)
+              : xhr.responseText || xhr.statusText;
+        reject(new ApiError(xhr.status, text, parsed));
       }
     };
 

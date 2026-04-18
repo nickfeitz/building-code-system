@@ -505,12 +505,14 @@ async def chat(request: ChatRequest):
         # asyncpg needs vector as string for ::vector cast
         embedding_str = "[" + ",".join(str(x) for x in question_embedding) + "]"
         async with db_pool.acquire() as conn:
-            # Vector similarity search
+            # Vector similarity search — exclude superseded versions so
+            # replies don't cite outdated rows after a re-upload.
             vector_results = await conn.fetch(
                 """SELECT id, section_number, section_title, full_text,
                           1 - (embedding <=> $1::vector) as similarity
                    FROM code_sections
                    WHERE code_book_id = $2
+                   AND superseded_date IS NULL
                    AND 1 - (embedding <=> $1::vector) > 0.5
                    ORDER BY similarity DESC
                    LIMIT 5""",
@@ -525,6 +527,7 @@ async def chat(request: ChatRequest):
                                   to_tsquery('english', $1)) as rank
                    FROM code_sections
                    WHERE code_book_id = $2
+                   AND superseded_date IS NULL
                    AND to_tsvector('english', full_text) @@ to_tsquery('english', $1)
                    ORDER BY rank DESC
                    LIMIT 5""",
@@ -676,7 +679,9 @@ async def search_sections(
     """Search sections"""
     try:
         async with db_pool.acquire() as conn:
-            query = "SELECT id, section_title, full_text, code_book_id, chapter, section_number FROM code_sections WHERE 1=1"
+            # Default to current (non-superseded) versions only.
+            query = ("SELECT id, section_title, full_text, code_book_id, chapter, "
+                     "section_number FROM code_sections WHERE superseded_date IS NULL")
             params = []
             
             if q:
@@ -730,6 +735,7 @@ async def hybrid_search(
                           1 - (embedding <=> $1::vector) as similarity
                    FROM code_sections
                    WHERE code_book_id = COALESCE($2, code_book_id)
+                   AND superseded_date IS NULL
                    AND embedding IS NOT NULL
                    ORDER BY embedding <=> $1::vector
                    LIMIT $3""",
@@ -743,6 +749,7 @@ async def hybrid_search(
                                   to_tsquery('english', $1)) as rank
                    FROM code_sections
                    WHERE code_book_id = COALESCE($2, code_book_id)
+                   AND superseded_date IS NULL
                    AND to_tsvector('english', full_text) @@ to_tsquery('english', $1)
                    ORDER BY rank DESC
                    LIMIT $3""",
@@ -947,6 +954,64 @@ async def upload_pdf(
             pdf_bytes = f.read()
 
         async with db_pool.acquire() as conn:
+            # Dedup guard 1: same (book, sha256) ⇒ refuse with 409.
+            # The UX contract is "identical bytes = nothing to do"; the
+            # bytes are already persisted and the sections are already
+            # indexed. Return the existing pdf_id + counts so the client
+            # can surface a friendly "already uploaded" message with a
+            # link to Review.
+            existing = await conn.fetchrow(
+                """SELECT id, filename, uploaded_at
+                     FROM code_book_pdfs
+                    WHERE code_book_id = $1 AND sha256 = $2""",
+                code_book_id, sha256,
+            )
+            if existing:
+                current_sections = await conn.fetchval(
+                    """SELECT count(*) FROM code_sections
+                        WHERE code_book_id = $1 AND superseded_date IS NULL""",
+                    code_book_id,
+                )
+                # Discard the temp file on disk — we're not going to parse.
+                try:
+                    os.remove(temp_file_path)
+                except OSError:
+                    pass
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "status": "duplicate",
+                        "message": "Identical PDF already uploaded for this book.",
+                        "pdf_id": existing["id"],
+                        "filename": existing["filename"],
+                        "uploaded_at": existing["uploaded_at"].isoformat()
+                                      if existing["uploaded_at"] else None,
+                        "current_sections": current_sections,
+                        "code_book_id": code_book_id,
+                        "code_name": book["code_name"],
+                    },
+                )
+
+            # New bytes: this is treated as a new version of the book.
+            # Mark any currently-live sections superseded so search/stats
+            # stop returning them, then insert the fresh PDF + run parse.
+            status_tag = await conn.execute(
+                """UPDATE code_sections
+                      SET superseded_date = CURRENT_DATE, updated_at = NOW()
+                    WHERE code_book_id = $1 AND superseded_date IS NULL""",
+                code_book_id,
+            )
+            # asyncpg returns "UPDATE N" for execute() of an UPDATE.
+            try:
+                superseded_n = int(status_tag.split()[-1])
+            except (ValueError, IndexError):
+                superseded_n = 0
+            if superseded_n:
+                logger.info(
+                    "Superseded %s prior sections for code_book %s before new ingest",
+                    superseded_n, code_book_id,
+                )
+
             pdf_id = await conn.fetchval(
                 """
                 INSERT INTO code_book_pdfs
@@ -1007,6 +1072,7 @@ async def upload_pdf(
                 embedding_url=EMBEDDING_SERVICE_URL,
                 source_id=source_id,
                 import_log_id=import_log_id,
+                source_pdf_id=pdf_id,
             )
         )
 
@@ -1214,6 +1280,7 @@ async def list_book_sections(
                               section_type
                          FROM code_sections
                         WHERE code_book_id = $1 AND page_number = $2
+                          AND superseded_date IS NULL
                         ORDER BY display_order NULLS LAST, id
                         LIMIT $3""",
                     book_id, page, limit,
@@ -1225,6 +1292,7 @@ async def list_book_sections(
                               section_type
                          FROM code_sections
                         WHERE code_book_id = $1
+                          AND superseded_date IS NULL
                         ORDER BY display_order NULLS LAST, id
                         LIMIT $2""",
                     book_id, limit,
@@ -1647,7 +1715,11 @@ async def get_stats():
     """Get system statistics for the dashboard"""
     try:
         async with db_pool.acquire() as conn:
-            sections = await conn.fetchval("SELECT count(*) FROM code_sections")
+            # Dashboard "Code Sections" card shows current (non-superseded)
+            # rows only; superseded historical versions shouldn't inflate it.
+            sections = await conn.fetchval(
+                "SELECT count(*) FROM code_sections WHERE superseded_date IS NULL"
+            )
             references = await conn.fetchval("SELECT count(*) FROM code_references")
             quarantined = await conn.fetchval(
                 "SELECT count(*) FROM content_quarantine WHERE reviewed_at IS NULL"
@@ -1696,8 +1768,12 @@ async def get_catalog():
             rows = await conn.fetch(
                 """
                 WITH section_counts AS (
+                    -- Only count current versions so the Catalog's
+                    -- indexed_section_count matches what chat/search see.
                     SELECT code_book_id, count(*)::int AS cnt
-                    FROM code_sections GROUP BY code_book_id
+                    FROM code_sections
+                    WHERE superseded_date IS NULL
+                    GROUP BY code_book_id
                 ),
                 latest_import AS (
                     SELECT DISTINCT ON (code_book_id)

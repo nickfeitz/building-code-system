@@ -1,6 +1,6 @@
 import { useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { uploadPdf, ApiError, type UploadProgress } from "../api/client";
+import { uploadPdf, ApiError, asDuplicate, type UploadProgress } from "../api/client";
 import type { CatalogBook, CatalogResponse } from "../api/types";
 import { useCatalog } from "../hooks/useCatalog";
 import { useImports } from "../hooks/useImports";
@@ -178,11 +178,20 @@ export function ImportPanel() {
       qc.invalidateQueries({ queryKey: ["catalog"] });
       qc.invalidateQueries({ queryKey: ["stats"] });
     } catch (e) {
-      setMsg(
-        e instanceof ApiError
-          ? `Upload failed (${e.status}): ${e.message}`
-          : String(e)
-      );
+      const dup = asDuplicate(e);
+      if (dup) {
+        setMsg(
+          `✓ Already uploaded — identical bytes were stored on ${dup.uploaded_at ? new Date(dup.uploaded_at).toLocaleString() : "a prior upload"} as ${dup.filename}. ` +
+          `${dup.current_sections} current section${dup.current_sections === 1 ? "" : "s"} indexed for this book. Nothing to do.`
+        );
+        setProgress(null);
+      } else {
+        setMsg(
+          e instanceof ApiError
+            ? `Upload failed (${e.status}): ${e.message}`
+            : String(e)
+        );
+      }
     } finally {
       setBusy(false);
       abortRef.current = null;

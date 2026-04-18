@@ -38,6 +38,7 @@ async def import_pdf(
     embedding_url: str,
     source_id: Optional[int] = None,
     import_log_id: Optional[int] = None,
+    source_pdf_id: Optional[int] = None,
 ) -> ImportResult:
     """Import PDF and insert code sections into database.
 
@@ -51,6 +52,9 @@ async def import_pdf(
             upload endpoint prepares the log row at request time, it passes
             that id here so the worker updates the *same* row instead of
             creating a second orphan. If None, we create one.
+        source_pdf_id: ``code_book_pdfs.id`` this parse came from. Stored
+            on every inserted section so the review UI can link back and
+            so future uploads know which rows they're replacing.
 
     Returns:
         ImportResult with counts and errors
@@ -149,8 +153,8 @@ async def import_pdf(
                         '''INSERT INTO code_sections
                            (code_book_id, chapter, section_number, section_title,
                             full_text, section_type, depth, path, has_ca_amendment,
-                            amendment_agency, source_hash, page_number)
-                           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                            amendment_agency, source_hash, page_number, source_pdf_id)
+                           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                            RETURNING id''',
                         code_book_id,
                         section.chapter,
@@ -164,6 +168,7 @@ async def import_pdf(
                         section.amendment_agency,
                         section_hash,
                         section.page_number,
+                        source_pdf_id,
                     )
 
                     # Generate embedding
