@@ -46,11 +46,10 @@ export function Sidebar({
 
   const groups: NavItem["group"][] = ["System", "Main", "Management"];
 
-  // The "light" mark (hat only) reads well on dark surfaces; the "dark"
-  // mark (hat + black gear) pops on light surfaces. So we swap to the
-  // inverse of the effective theme.
+  // Dark mode gets the hat-only mark (reads on dark surfaces); light
+  // mode gets the hat + black gear mark (reads on light surfaces).
   const logoSrc =
-    effective === "dark" ? "/favicon-light.svg" : "/favicon-dark.svg";
+    effective === "dark" ? "/BC-Logo.png" : "/BC-Logo-Black.png";
 
   return (
     <aside className="w-60 bg-surface-900 border-r border-surface-400 flex flex-col">
