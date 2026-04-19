@@ -38,9 +38,12 @@ export function Sidebar({
 
   return (
     <aside className="w-60 bg-surface-900 border-r border-surface-400 flex flex-col">
-      <div className="px-5 py-4 border-b border-surface-400">
-        <div className="text-base font-semibold text-white">Building Code</div>
-        <div className="text-xs text-surface-100">Intelligence System</div>
+      <div className="px-5 py-4 border-b border-surface-400 flex items-center gap-3">
+        <img src="/favicon.svg" alt="" className="w-9 h-9 shrink-0" />
+        <div>
+          <div className="text-base font-semibold text-white leading-tight">Building Code</div>
+          <div className="text-xs text-surface-100 leading-tight">Intelligence System</div>
+        </div>
       </div>
 
       <nav className="flex-1 overflow-y-auto py-2">
