@@ -931,24 +931,24 @@ function PdfPager({
         </button>
       </div>
 
-      {/* Prefetch neighbors at current zoom so page flips are instant.
-          Zero-sized, no layout impact. */}
-      {!atStart && (
-        <img
-          src={pdfPageImageUrl(pdfId, page - 1, dpi)}
-          alt=""
-          aria-hidden
-          className="w-0 h-0 opacity-0 pointer-events-none"
-        />
-      )}
-      {!atEnd && (
-        <img
-          src={pdfPageImageUrl(pdfId, page + 1, dpi)}
-          alt=""
-          aria-hidden
-          className="w-0 h-0 opacity-0 pointer-events-none"
-        />
-      )}
+      {/* Prefetch ±2 neighbors at current zoom so page flips are instant
+          even when the reader skips ahead two. Zero-sized, no layout
+          impact; the browser's HTTP cache plus our server-side PNG cache
+          mean repeated flips are essentially free. */}
+      {[-2, -1, 1, 2].map((delta) => {
+        const p = page + delta;
+        if (p < 1) return null;
+        if (pageCount != null && p > pageCount) return null;
+        return (
+          <img
+            key={`pre-${delta}`}
+            src={pdfPageImageUrl(pdfId, p, dpi)}
+            alt=""
+            aria-hidden
+            className="w-0 h-0 opacity-0 pointer-events-none"
+          />
+        );
+      })}
     </div>
   );
 }

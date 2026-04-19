@@ -5,11 +5,13 @@ import logging
 import asyncio
 import httpx
 import tempfile
+import threading
+from collections import OrderedDict
 from typing import Optional, List, Dict, Any, AsyncGenerator
 from datetime import datetime
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Query
+from fastapi import FastAPI, HTTPException, UploadFile, File, Query, Request
 from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel
 import uvicorn
@@ -1280,7 +1282,82 @@ async def reindex_pdf(pdf_id: int):
 # is CPU-bound and blocking, so we wrap the fitz calls in
 # asyncio.to_thread() to keep the event loop responsive.
 
-async def _fetch_pdf_bytes(pdf_id: int) -> tuple[bytes, str | None]:
+# --- In-memory caches for PDF rendering -----------------------------------
+#
+# Every PDF page render used to re-fetch the full PDF bytes from Postgres
+# (~188 MB for ASCE 7-22) and re-render the PNG from scratch, even when
+# the same user is flipping pages within one book. Two LRU caches now
+# absorb those costs:
+#
+#   - PDF_BYTES cache: keyed by pdf_id. Skips the DB round-trip once
+#     warm. Bounded by count (default 3 PDFs = ~600 MB worst case for
+#     ASCE-sized files). Invalidated on reindex.
+#
+#   - PNG cache: keyed by (pdf_id, page, dpi). Lets the browser (and
+#     any other client) ask for the same page repeatedly at basically
+#     zero cost — the PNG is served straight from RAM. Bounded by
+#     count (default 100 entries ≈ 50 MB at 500 KB/page).
+#
+# Both are thread-safe; the render path runs on a worker thread via
+# asyncio.to_thread so locks matter.
+
+_PDF_BYTES_CACHE_MAX = int(os.getenv("PDF_BYTES_CACHE_MAX", "3"))
+_PNG_CACHE_MAX = int(os.getenv("PDF_PNG_CACHE_MAX", "100"))
+
+_pdf_bytes_cache: "OrderedDict[int, tuple[bytes, Optional[str]]]" = OrderedDict()
+_pdf_bytes_lock = threading.Lock()
+
+_png_cache: "OrderedDict[tuple[int, int, int], bytes]" = OrderedDict()
+_png_cache_lock = threading.Lock()
+
+
+def _pdf_bytes_cache_get(pdf_id: int) -> Optional[tuple[bytes, Optional[str]]]:
+    with _pdf_bytes_lock:
+        v = _pdf_bytes_cache.get(pdf_id)
+        if v is not None:
+            _pdf_bytes_cache.move_to_end(pdf_id)
+        return v
+
+
+def _pdf_bytes_cache_put(pdf_id: int, value: tuple[bytes, Optional[str]]) -> None:
+    with _pdf_bytes_lock:
+        _pdf_bytes_cache[pdf_id] = value
+        _pdf_bytes_cache.move_to_end(pdf_id)
+        while len(_pdf_bytes_cache) > _PDF_BYTES_CACHE_MAX:
+            _pdf_bytes_cache.popitem(last=False)
+
+
+def _png_cache_get(key: tuple[int, int, int]) -> Optional[bytes]:
+    with _png_cache_lock:
+        v = _png_cache.get(key)
+        if v is not None:
+            _png_cache.move_to_end(key)
+        return v
+
+
+def _png_cache_put(key: tuple[int, int, int], value: bytes) -> None:
+    with _png_cache_lock:
+        _png_cache[key] = value
+        _png_cache.move_to_end(key)
+        while len(_png_cache) > _PNG_CACHE_MAX:
+            _png_cache.popitem(last=False)
+
+
+def _invalidate_pdf_caches(pdf_id: int) -> None:
+    """Drop every cached artifact for ``pdf_id``. Call on reindex / delete."""
+    with _pdf_bytes_lock:
+        _pdf_bytes_cache.pop(pdf_id, None)
+    with _png_cache_lock:
+        victims = [k for k in _png_cache if k[0] == pdf_id]
+        for k in victims:
+            _png_cache.pop(k, None)
+
+
+async def _fetch_pdf_bytes(pdf_id: int) -> tuple[bytes, Optional[str]]:
+    """Cache-aware: warm path is RAM-only; cold path hits Postgres once."""
+    cached = _pdf_bytes_cache_get(pdf_id)
+    if cached is not None:
+        return cached
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT filename, content, size_bytes FROM code_book_pdfs WHERE id = $1",
@@ -1288,7 +1365,9 @@ async def _fetch_pdf_bytes(pdf_id: int) -> tuple[bytes, str | None]:
         )
     if not row:
         raise HTTPException(status_code=404, detail="PDF not found")
-    return bytes(row["content"]), row["filename"]
+    result = (bytes(row["content"]), row["filename"])
+    _pdf_bytes_cache_put(pdf_id, result)
+    return result
 
 
 @app.get("/api/code-book-pdfs/{pdf_id}/pages")
@@ -1321,9 +1400,55 @@ async def pdf_meta(pdf_id: int):
 
 
 @app.get("/api/code-book-pdfs/{pdf_id}/pages/{page}.png")
-async def pdf_page_png(pdf_id: int, page: int, dpi: int = Query(150, ge=72, le=300)):
-    """Render a single PDF page to PNG on demand."""
+async def pdf_page_png(
+    pdf_id: int,
+    page: int,
+    request: Request,
+    dpi: int = Query(150, ge=72, le=300),
+):
+    """Render a single PDF page to PNG on demand.
+
+    Hot path layers (fastest first):
+        1. Conditional-GET: ``If-None-Match`` === ETag → 304, no body.
+        2. Server-side PNG LRU cache → RAM → Response body.
+        3. Server-side PDF-bytes LRU cache + fitz render.
+        4. Cold path: Postgres fetch + fitz render + cache population.
+
+    ETag is ``"{pdf_id}-{page}-{dpi}"`` — bytes for that triple are
+    immutable as long as the row in ``code_book_pdfs`` exists, so the
+    strong-ETag semantics are correct.
+    """
     try:
+        etag = f'"{pdf_id}-{page}-{dpi}"'
+
+        # Layer 1: conditional GET. The browser already has bytes that
+        # match — respond 304 and skip everything downstream.
+        inm = request.headers.get("if-none-match")
+        if inm and etag in (v.strip() for v in inm.split(",")):
+            return Response(
+                status_code=304,
+                headers={
+                    "ETag": etag,
+                    "Cache-Control": "public, max-age=3600",
+                },
+            )
+
+        # Layer 2: server-side PNG cache.
+        key = (pdf_id, page, dpi)
+        cached_png = _png_cache_get(key)
+        if cached_png is not None:
+            return Response(
+                content=cached_png,
+                media_type="image/png",
+                headers={
+                    "ETag": etag,
+                    "Cache-Control": "public, max-age=3600",
+                    "X-Cache": "HIT",
+                },
+            )
+
+        # Layer 3/4: render. fetch_pdf_bytes itself is cached; the
+        # fitz.open() cost on cached bytes is milliseconds.
         pdf_bytes, _ = await _fetch_pdf_bytes(pdf_id)
 
         def render() -> bytes:
@@ -1341,13 +1466,14 @@ async def pdf_page_png(pdf_id: int, page: int, dpi: int = Query(150, ge=72, le=3
                 doc.close()
 
         png = await asyncio.to_thread(render)
+        _png_cache_put(key, png)
         return Response(
             content=png,
             media_type="image/png",
             headers={
-                # Cache-key effectively includes (pdf_id, page, dpi) via URL —
-                # safe to instruct the browser to cache for an hour.
+                "ETag": etag,
                 "Cache-Control": "public, max-age=3600",
+                "X-Cache": "MISS",
             },
         )
     except HTTPException:
