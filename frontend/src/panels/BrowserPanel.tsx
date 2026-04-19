@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import { pdfPageImageUrl } from "../api/client";
 import type { CatalogBook } from "../api/types";
 import { useCatalog } from "../hooks/useCatalog";
@@ -121,6 +121,140 @@ function flattenSubtree(root: TreeNode): OutlineRow[] {
   };
   walk(root);
   return out;
+}
+
+/**
+ * Reflow PDF-extracted body text into prose paragraphs. PyMuPDF's text
+ * layer preserves visual line wraps from the printed page — i.e. every
+ * line-break in the output is usually just where the PDF wrapped, not
+ * where the author intended a new paragraph. We undo that so a section
+ * reads as flowing prose.
+ *
+ * Heuristics, in order:
+ *   1. Strip the leading "N.N.N  Title" header if the text starts with
+ *      its own section_number (redundant — we already rendered the
+ *      heading in <h1/2/3/4>).
+ *   2. Split on blank lines as hard paragraph boundaries.
+ *   3. Within a block, put each list item / EXCEPTION / Note on its own
+ *      paragraph so the ordered-list structure of the code survives.
+ *   4. All remaining soft line wraps collapse to a single space. De-hyphenates
+ *      words split across wraps ("build-\ning" → "building").
+ */
+function reflow(text: string, leadingHeader?: string): string[] {
+  if (!text) return [];
+  let work = text;
+  if (leadingHeader) {
+    // If the first non-whitespace token is the section number with
+    // optional title, strip it — we already show it as the heading.
+    const esc = leadingHeader.replace(/[-\/\\^$*+?.()|[\]{}]/g, "\\$&");
+    const re = new RegExp(`^\\s*${esc}[^\\n]{0,120}?(\\r?\\n|$)`);
+    work = work.replace(re, "");
+  }
+
+  // 2. Split on blank lines.
+  const blocks = work.split(/\n\s*\n+/);
+  const paragraphs: string[] = [];
+
+  for (const block of blocks) {
+    const lines = block
+      .split(/\r?\n/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (lines.length === 0) continue;
+
+    let buf = "";
+    const flush = () => {
+      if (buf) {
+        paragraphs.push(collapse(buf));
+        buf = "";
+      }
+    };
+
+    for (const line of lines) {
+      const isListLike =
+        /^(\d+\.\s)/.test(line) ||
+        /^\(\s*[a-z0-9ivx]+\s*\)/i.test(line) ||
+        /^(EXCEPTION|EXCEPTIONS|User Note|Note|COMMENTARY)s?:/i.test(line) ||
+        /^[•◦·●]\s/.test(line);
+
+      if (isListLike) {
+        flush();
+        buf = line;
+      } else if (buf && /-$/.test(buf)) {
+        // Word split across wrapped lines: drop the hyphen, no space.
+        buf = buf.slice(0, -1) + line;
+      } else if (buf) {
+        buf += " " + line;
+      } else {
+        buf = line;
+      }
+    }
+    flush();
+  }
+
+  return paragraphs;
+}
+
+function collapse(s: string): string {
+  return s.replace(/\s{2,}/g, " ").trim();
+}
+
+function isListItem(p: string): boolean {
+  return (
+    /^(\d+\.\s)/.test(p) ||
+    /^\(\s*[a-z0-9ivx]+\s*\)/i.test(p) ||
+    /^[•◦·●]\s/.test(p)
+  );
+}
+
+/**
+ * Replace "Section X.Y.Z", "Chapter N", "Figure X.Y-Z", "Table X.Y-Z",
+ * "Appendix X" occurrences with clickable links when the target exists
+ * in the current book's outline. Plain text is returned for references
+ * to sections outside the book (other codes, external standards).
+ */
+function linkifyRefs(
+  text: string,
+  refIndex: Map<string, OutlineRow>,
+  onJump: (id: number) => void,
+): ReactNode[] {
+  const parts: ReactNode[] = [];
+  const regex =
+    /(Sections?|Chapters?|Figures?|Tables?|Appendix|Appendices)\s+([A-Z]{0,3}\d+(?:[.\-]\d+)*(?:[A-Z]+)?)/g;
+  let last = 0;
+  let m: RegExpExecArray | null;
+  let key = 0;
+  while ((m = regex.exec(text)) !== null) {
+    const [full, , num] = m;
+    if (m.index > last) parts.push(text.slice(last, m.index));
+    // Try direct hit, then "Chapter N" / "Figure X.Y" forms.
+    const candidates = [
+      num,
+      `Chapter ${num}`,
+      `Figure ${num}`,
+      `Table ${num}`,
+      `Appendix ${num}`,
+    ];
+    const target = candidates
+      .map((c) => refIndex.get(c))
+      .find(Boolean) as OutlineRow | undefined;
+    if (target) {
+      parts.push(
+        <a
+          key={`r${key++}`}
+          className="text-accent hover:underline cursor-pointer"
+          onClick={() => onJump(target.id)}
+        >
+          {full}
+        </a>,
+      );
+    } else {
+      parts.push(full);
+    }
+    last = regex.lastIndex;
+  }
+  if (last < text.length) parts.push(text.slice(last));
+  return parts;
 }
 
 function findNode(roots: TreeNode[], id: number): TreeNode | null {
@@ -321,6 +455,7 @@ export function BrowserPanel() {
             node={selectedNode}
             breadcrumbs={breadcrumbs}
             pdfId={pdfId}
+            allRows={outline.data ?? []}
             onJump={setSelectedId}
           />
         </div>
@@ -397,16 +532,31 @@ function Reader({
   node,
   breadcrumbs,
   pdfId,
+  allRows,
   onJump,
 }: {
   node: TreeNode;
   breadcrumbs: OutlineRow[];
   pdfId: number | null;
+  allRows: OutlineRow[];
   onJump: (id: number) => void;
 }) {
   const rows = useMemo(() => flattenSubtree(node), [node]);
   const baseDepth = rows[0]?.depth ?? 0;
   const rootNumber = rows[0]?.section_number;
+
+  // Build a cheap lookup table so "Section 26.5.2" references in body
+  // text can be linkified to the section's in-book anchor. Keyed by
+  // section_number so both "26.5.2" and "Figure 26.5-1B" resolve if
+  // they exist in the outline.
+  const refIndex = useMemo(() => {
+    const m = new Map<string, OutlineRow>();
+    for (const r of allRows) {
+      const key = r.section_number.trim();
+      if (key && !m.has(key)) m.set(key, r);
+    }
+    return m;
+  }, [allRows]);
 
   return (
     <div className="max-w-3xl mx-auto px-6 py-8">
@@ -440,6 +590,8 @@ function Reader({
           isRoot={row.section_number === rootNumber}
           indent={Math.max(0, row.depth - baseDepth)}
           pdfId={pdfId}
+          refIndex={refIndex}
+          onJump={onJump}
         />
       ))}
     </div>
@@ -451,11 +603,15 @@ function SectionBlock({
   isRoot,
   indent,
   pdfId,
+  refIndex,
+  onJump,
 }: {
   row: OutlineRow;
   isRoot: boolean;
   indent: number;
   pdfId: number | null;
+  refIndex: Map<string, OutlineRow>;
+  onJump: (id: number) => void;
 }) {
   const [showPage, setShowPage] = useState(false);
   const title = row.section_title || "";
@@ -474,6 +630,11 @@ function SectionBlock({
     h4: "text-sm font-semibold text-white uppercase tracking-wide",
   }[HeadTag];
 
+  const paragraphs = useMemo(
+    () => reflow(row.full_text || "", row.section_number),
+    [row.full_text, row.section_number],
+  );
+
   return (
     <section
       id={`sec-${row.id}`}
@@ -491,10 +652,14 @@ function SectionBlock({
         </div>
       )}
 
-      {row.full_text && (
-        <pre className="mt-2 whitespace-pre-wrap text-[15px] leading-7 text-surface-50 font-sans">
-          {row.full_text}
-        </pre>
+      {paragraphs.length > 0 && (
+        <div className="mt-2 text-[15px] leading-7 text-surface-50 space-y-3">
+          {paragraphs.map((p, i) => (
+            <p key={i} className={isListItem(p) ? "pl-6 -indent-6" : ""}>
+              {linkifyRefs(p, refIndex, onJump)}
+            </p>
+          ))}
+        </div>
       )}
 
       {pdfId != null && row.page_number != null && (
