@@ -145,7 +145,7 @@ function BookRow({
         className="w-4 h-4 accent-blue-500 disabled:opacity-40 disabled:cursor-not-allowed"
       />
       <div className="flex-1 min-w-0">
-        <div className="flex items-center gap-2 text-sm text-white">
+        <div className="flex items-center gap-2 text-sm text-surface-50">
           {book.part_number && (
             <span className="font-mono text-xs text-surface-100 w-16 shrink-0">
               {book.part_number}
@@ -266,7 +266,7 @@ function CycleGroup({
     <details className="group" open={cycle.status === "active"}>
       <summary className="cursor-pointer select-none flex items-center gap-2 px-4 py-2 hover:bg-surface-700 rounded text-sm">
         <span className="text-surface-100 group-open:rotate-90 transition-transform">▸</span>
-        <span className="text-white font-medium">{cycle.name}</span>
+        <span className="text-surface-50 font-medium">{cycle.name}</span>
         <Badge tone={statusTone as "success" | "warn" | "neutral"}>{cycle.status}</Badge>
         {cycle.effective_date && (
           <span className="text-xs text-surface-100">eff. {cycle.effective_date}</span>
@@ -275,7 +275,7 @@ function CycleGroup({
         <span className="text-xs text-surface-100">{cycle.books.length} books</span>
         {scannableIds.length > 0 && (
           <label
-            className="text-xs text-surface-100 hover:text-white flex items-center gap-1 ml-3"
+            className="text-xs text-surface-100 hover:text-surface-50 flex items-center gap-1 ml-3"
             onClick={(e) => e.stopPropagation()}
           >
             <input
@@ -350,7 +350,7 @@ function AuthorityGroup({
 
   return (
     <details className="card !p-3 group" open>
-      <summary className="cursor-pointer select-none flex items-center gap-3 text-white">
+      <summary className="cursor-pointer select-none flex items-center gap-3 text-surface-50">
         <span className="text-surface-100 group-open:rotate-90 transition-transform">▸</span>
         <span className="font-semibold">{authority.adopting_authority}</span>
         <Badge>{authority.publishing_org_abbr}</Badge>
@@ -493,7 +493,7 @@ export function CatalogPanel({
         )}
         {result && (
           <div className="card">
-            <div className="text-sm text-white">Scan request submitted</div>
+            <div className="text-sm text-surface-50">Scan request submitted</div>
             <ul className="mt-2 text-xs text-surface-50 space-y-1">
               <li>
                 <span className="text-success">Triggered: {result.triggered.length}</span>
@@ -542,7 +542,7 @@ export function CatalogPanel({
       {/* Footer */}
       <div className="px-6 py-3 border-t border-surface-400 bg-surface-800 flex items-center gap-3">
         <div className="text-sm text-surface-50">
-          <span className="text-white font-semibold tabular-nums">{selected.size}</span> selected
+          <span className="text-surface-50 font-semibold tabular-nums">{selected.size}</span> selected
         </div>
         <div className="flex-1" />
         <button className="btn-ghost" onClick={clear} disabled={selected.size === 0}>

@@ -53,7 +53,7 @@ function FlagModal({
         className="card w-full max-w-md !p-5 space-y-3"
         onClick={(e) => e.stopPropagation()}
       >
-        <h2 className="text-sm font-semibold text-white">
+        <h2 className="text-sm font-semibold text-surface-50">
           Flag page {page} as bad extraction
         </h2>
         <p className="text-xs text-surface-100">
@@ -200,7 +200,7 @@ export function ReviewPanel({
           ← Back to Catalog
         </button>
         <div className="min-w-0 flex-1">
-          <div className="text-white truncate">{codeName}</div>
+          <div className="text-surface-50 truncate">{codeName}</div>
           <div className="text-xs text-surface-100 truncate">
             {filename ?? `PDF #${pdfId}`} · pdf_id={pdfId}
           </div>
@@ -306,7 +306,7 @@ export function ReviewPanel({
         <div className="overflow-auto p-4 space-y-4">
           <div className="card">
             <div className="flex items-center justify-between mb-2">
-              <h3 className="text-sm font-semibold text-white">
+              <h3 className="text-sm font-semibold text-surface-50">
                 Extracted text (PyMuPDF)
               </h3>
               <span className="text-xs text-surface-100">
@@ -333,7 +333,7 @@ export function ReviewPanel({
 
           <div className="card">
             <div className="flex items-center justify-between mb-2">
-              <h3 className="text-sm font-semibold text-white">
+              <h3 className="text-sm font-semibold text-surface-50">
                 Sections on this page
               </h3>
               <span className="text-xs text-surface-100">
@@ -359,7 +359,7 @@ export function ReviewPanel({
                       </span>
                     )}
                   </div>
-                  <div className="text-sm text-white">{s.section_title}</div>
+                  <div className="text-sm text-surface-50">{s.section_title}</div>
                   <div className="text-xs text-surface-100 mt-0.5 line-clamp-3">
                     {s.full_text.slice(0, 280)}
                   </div>

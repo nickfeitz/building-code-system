@@ -57,7 +57,7 @@ function BookPicker({
         className="input flex items-center justify-between w-full text-left"
         onClick={() => setOpen((o) => !o)}
       >
-        <span className={value ? "text-white truncate" : "text-surface-200"}>
+        <span className={value ? "text-surface-50 truncate" : "text-surface-200"}>
           {value ? value.code_name : "Pick a code book…"}
         </span>
         <span className="text-surface-100 text-xs ml-2">{open ? "▾" : "▸"}</span>
@@ -78,7 +78,7 @@ function BookPicker({
               {value && (
                 <button
                   type="button"
-                  className="ml-3 underline hover:text-white"
+                  className="ml-3 underline hover:text-surface-50"
                   onClick={() => {
                     onChange(null);
                     setOpen(false);
@@ -109,7 +109,7 @@ function BookPicker({
                     value?.id === book.id ? "bg-accent/20" : ""
                   }`}
                 >
-                  <div className="text-white truncate">{book.code_name}</div>
+                  <div className="text-surface-50 truncate">{book.code_name}</div>
                   <div className="text-xs text-surface-100 mt-0.5">
                     {cycle}
                     {book.part_number && ` · ${book.part_number}`}
@@ -203,7 +203,7 @@ export function ImportPanel() {
   return (
     <div className="h-full overflow-y-auto p-6 space-y-6">
       <div className="card">
-        <h2 className="text-sm font-semibold text-white mb-3">Upload PDF</h2>
+        <h2 className="text-sm font-semibold text-surface-50 mb-3">Upload PDF</h2>
         <p className="text-xs text-surface-100 mb-3">
           Pick the code this PDF is for, then choose a file. The PDF is stored
           in Postgres and the parsed sections are linked to that book + indexed
@@ -272,7 +272,7 @@ export function ImportPanel() {
 
       <div className="card">
         <div className="flex items-center justify-between mb-3">
-          <h2 className="text-sm font-semibold text-white">Recent Imports</h2>
+          <h2 className="text-sm font-semibold text-surface-50">Recent Imports</h2>
           <span className="text-xs text-surface-100">
             auto-refreshing · 2 s while active
           </span>

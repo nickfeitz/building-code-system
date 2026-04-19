@@ -7,6 +7,7 @@ import { CatalogPanel } from "./panels/CatalogPanel";
 import { ImportPanel } from "./panels/ImportPanel";
 import { QuarantinePanel } from "./panels/QuarantinePanel";
 import { ReviewPanel } from "./panels/ReviewPanel";
+import { SettingsPanel } from "./panels/SettingsPanel";
 import type { ReviewContext } from "./api/types";
 
 const TITLES: Record<PanelKey, string> = {
@@ -16,6 +17,7 @@ const TITLES: Record<PanelKey, string> = {
   catalog: "Code Catalog",
   import: "Import",
   quarantine: "Quarantine Review",
+  settings: "Settings",
 };
 
 export default function App() {
@@ -40,7 +42,7 @@ export default function App() {
       <Sidebar active={panel} onSelect={selectPanel} />
       <main className="flex-1 flex flex-col min-w-0">
         <header className="h-14 flex items-center px-6 border-b border-surface-400 bg-surface-800">
-          <h1 className="text-lg font-semibold text-white">
+          <h1 className="text-lg font-semibold text-surface-50">
             {reviewCtx ? "Image Review" : TITLES[panel]}
           </h1>
         </header>
@@ -58,6 +60,7 @@ export default function App() {
               {panel === "catalog" && <CatalogPanel onReview={startReview} />}
               {panel === "import" && <ImportPanel />}
               {panel === "quarantine" && <QuarantinePanel />}
+              {panel === "settings" && <SettingsPanel />}
             </>
           )}
         </div>

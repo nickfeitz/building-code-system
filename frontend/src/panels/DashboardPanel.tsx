@@ -7,7 +7,7 @@ function StatCard({ label, value, hint }: { label: string; value: React.ReactNod
   return (
     <div className="card">
       <div className="text-xs uppercase tracking-wider text-surface-100">{label}</div>
-      <div className="mt-2 text-3xl font-semibold text-white tabular-nums">{value}</div>
+      <div className="mt-2 text-3xl font-semibold text-surface-50 tabular-nums">{value}</div>
       {hint && <div className="mt-1 text-xs text-surface-100">{hint}</div>}
     </div>
   );
@@ -75,7 +75,7 @@ export function DashboardPanel() {
       {/* Middle row: services + LLM */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <div className="card">
-          <h2 className="text-sm font-semibold text-white mb-2">System Health</h2>
+          <h2 className="text-sm font-semibold text-surface-50 mb-2">System Health</h2>
           <div className="text-xs text-surface-100 mb-2">
             Overall:{" "}
             <span
@@ -101,12 +101,12 @@ export function DashboardPanel() {
         </div>
 
         <div className="card">
-          <h2 className="text-sm font-semibold text-white mb-2">LLM</h2>
+          <h2 className="text-sm font-semibold text-surface-50 mb-2">LLM</h2>
           <div className="text-sm text-surface-50">
-            Provider: <span className="text-white">{llm.data?.provider ?? "—"}</span>
+            Provider: <span className="text-surface-50">{llm.data?.provider ?? "—"}</span>
           </div>
           <div className="text-sm text-surface-50">
-            Default model: <span className="text-white">{llm.data?.model ?? "—"}</span>
+            Default model: <span className="text-surface-50">{llm.data?.model ?? "—"}</span>
           </div>
           <div className="mt-3">
             <div className="text-xs uppercase tracking-wider text-surface-100 mb-2">
@@ -130,7 +130,7 @@ export function DashboardPanel() {
       {/* Imports */}
       <div className="card">
         <div className="flex items-center justify-between mb-3">
-          <h2 className="text-sm font-semibold text-white">
+          <h2 className="text-sm font-semibold text-surface-50">
             Imports
             {activeCount > 0 && (
               <span className="ml-2 badge bg-accent/30 text-accent animate-pulse">

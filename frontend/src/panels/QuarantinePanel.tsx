@@ -20,7 +20,7 @@ export function QuarantinePanel() {
   return (
     <div className="h-full overflow-y-auto p-6">
       <div className="card">
-        <h2 className="text-sm font-semibold text-white mb-3">
+        <h2 className="text-sm font-semibold text-surface-50 mb-3">
           Pending Quarantine ({list.data?.length ?? 0})
         </h2>
         {list.isLoading && <div className="text-xs text-surface-100">loading…</div>}
@@ -36,7 +36,7 @@ export function QuarantinePanel() {
               <div className="flex items-start justify-between gap-4">
                 <div className="min-w-0">
                   <div className="text-xs text-surface-100">{it.source}</div>
-                  <div className="text-sm text-white truncate">{it.reason}</div>
+                  <div className="text-sm text-surface-50 truncate">{it.reason}</div>
                   {it.content && (
                     <div className="text-xs text-surface-100 mt-2 line-clamp-3">
                       {it.content}

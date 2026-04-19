@@ -670,10 +670,10 @@ function SectionBlock({
   const HeadTag: "h1" | "h2" | "h3" | "h4" =
     isRoot ? "h1" : indent === 0 ? "h2" : indent === 1 ? "h3" : "h4";
   const headClass = {
-    h1: "text-2xl font-semibold text-white",
-    h2: "text-xl font-semibold text-white",
-    h3: "text-base font-semibold text-white",
-    h4: "text-sm font-semibold text-white uppercase tracking-wide",
+    h1: "text-2xl font-semibold text-surface-50",
+    h2: "text-xl font-semibold text-surface-50",
+    h3: "text-base font-semibold text-surface-50",
+    h4: "text-sm font-semibold text-surface-50 uppercase tracking-wide",
   }[HeadTag];
 
   const paragraphs = useMemo(

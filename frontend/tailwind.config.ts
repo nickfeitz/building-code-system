@@ -1,23 +1,28 @@
 import type { Config } from "tailwindcss";
 
+// Surface colours are driven by CSS variables (see styles.css) so the scale
+// flips when the `dark` class is toggled on <html>. Values below are declared
+// as `rgb(var(--name) / <alpha-value>)` so Tailwind opacity modifiers
+// (e.g. `bg-accent/20`) continue to work.
+const surfaceVar = (token: string) => `rgb(var(--${token}) / <alpha-value>)`;
+
 export default {
   content: ["./index.html", "./src/**/*.{ts,tsx}"],
   darkMode: "class",
   theme: {
     extend: {
       colors: {
-        // Surface scale roughly mirroring the previous htmx UI's #1a1a1a / #0d0d0d / #333
         surface: {
-          900: "#0a0a0a",
-          800: "#111111",
-          700: "#1a1a1a",
-          600: "#222222",
-          500: "#2a2a2a",
-          400: "#333333",
-          300: "#444444",
-          200: "#666666",
-          100: "#999999",
-          50: "#cccccc",
+          900: surfaceVar("surface-900"),
+          800: surfaceVar("surface-800"),
+          700: surfaceVar("surface-700"),
+          600: surfaceVar("surface-600"),
+          500: surfaceVar("surface-500"),
+          400: surfaceVar("surface-400"),
+          300: surfaceVar("surface-300"),
+          200: surfaceVar("surface-200"),
+          100: surfaceVar("surface-100"),
+          50: surfaceVar("surface-50"),
         },
         accent: {
           DEFAULT: "#3b82f6", // blue-500

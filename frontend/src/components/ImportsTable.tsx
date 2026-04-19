@@ -89,7 +89,7 @@ function ReindexButton({ pdfId }: { pdfId: number }) {
         type="button"
         onClick={onClick}
         disabled={busy}
-        className="underline hover:text-white disabled:opacity-50"
+        className="underline hover:text-surface-50 disabled:opacity-50"
         title="Re-parse the stored PDF for this book"
       >
         {busy ? "queueing…" : "re-index"}
@@ -126,7 +126,7 @@ export function ImportsTable({
           <div key={r.id} className="py-2.5 space-y-1">
             <div className="flex items-baseline gap-2 flex-wrap">
               <PhaseBadge phase={r.phase} status={r.status} />
-              <span className="text-sm text-white truncate flex-1 min-w-0">
+              <span className="text-sm text-surface-50 truncate flex-1 min-w-0">
                 {r.book_name ?? (r.source_type === "web_scrape" ? "Catalog scan" : `#${r.id}`)}
               </span>
               <span className="text-xs text-surface-100 shrink-0">
@@ -154,7 +154,7 @@ export function ImportsTable({
                     <ReindexButton pdfId={r.pdf_id} />
                   )}
                   <a
-                    className="underline hover:text-white"
+                    className="underline hover:text-surface-50"
                     href={`/api/code-book-pdfs/${r.pdf_id}/content`}
                     target="_blank"
                     rel="noreferrer"
