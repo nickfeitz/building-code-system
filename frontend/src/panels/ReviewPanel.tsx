@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
-import { pdfPageImageUrl } from "../api/client";
+import { useQueryClient } from "@tanstack/react-query";
+import { pdfPageImageUrl, reindexPdf, ApiError } from "../api/client";
 import type { FlagReason, ReviewContext } from "../api/types";
 import {
   useFlagPage,
@@ -117,6 +118,8 @@ export function ReviewPanel({
   const [imgLoading, setImgLoading] = useState(true);
   const [flagOpen, setFlagOpen] = useState(false);
   const [flagToast, setFlagToast] = useState<string | null>(null);
+  const [reindexing, setReindexing] = useState(false);
+  const qc = useQueryClient();
 
   const pageText = usePageText(pdfId, page);
   const pageSections = usePageSections(codeBookId, page);
@@ -143,6 +146,33 @@ export function ReviewPanel({
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [page, goto, flagOpen, onClose]);
+
+  const onReindex = async () => {
+    if (reindexing) return;
+    const ok = window.confirm(
+      `Re-parse "${codeName}"? This will mark any current indexed sections for this book as superseded and replace them with a fresh parse of the stored PDF.`,
+    );
+    if (!ok) return;
+    setReindexing(true);
+    try {
+      const r = await reindexPdf(pdfId);
+      setFlagToast(`Re-index queued · import_log_id ${r.import_log_id}`);
+      setTimeout(() => setFlagToast(null), 4000);
+      qc.invalidateQueries({ queryKey: ["imports"] });
+      qc.invalidateQueries({ queryKey: ["book-page-sections"] });
+      qc.invalidateQueries({ queryKey: ["catalog"] });
+      qc.invalidateQueries({ queryKey: ["stats"] });
+    } catch (e) {
+      setFlagToast(
+        e instanceof ApiError
+          ? `Re-index failed (${e.status}): ${e.message}`
+          : `Re-index failed: ${String(e)}`,
+      );
+      setTimeout(() => setFlagToast(null), 6000);
+    } finally {
+      setReindexing(false);
+    }
+  };
 
   const onSubmitFlag = async (reason: FlagReason, note: string) => {
     try {
@@ -221,6 +251,15 @@ export function ReviewPanel({
           </select>
         </div>
 
+        <button
+          type="button"
+          onClick={onReindex}
+          disabled={reindexing}
+          className="btn-ghost !py-1 !px-2 !text-xs"
+          title="Re-parse the stored PDF for this book (replaces current sections)"
+        >
+          {reindexing ? "Queueing…" : "↻ Re-index"}
+        </button>
         <button
           type="button"
           onClick={() => setFlagOpen(true)}

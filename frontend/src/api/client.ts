@@ -108,6 +108,25 @@ export function pdfPageImageUrl(pdfId: number, page: number, dpi: number): strin
   return `${API_BASE}/code-book-pdfs/${pdfId}/pages/${page}.png?dpi=${dpi}`;
 }
 
+export interface ReindexResponse {
+  status: string;
+  import_log_id: number;
+  pdf_id: number;
+  code_book_id: number;
+  filename: string;
+  superseded_sections: number;
+}
+
+/**
+ * Re-parse an already-stored PDF. No new upload; the backend loads the
+ * bytes straight from code_book_pdfs and runs them through the parser
+ * pipeline again. Current (non-superseded) sections for the book are
+ * stamped superseded first, so the new parse produces a fresh generation.
+ */
+export async function reindexPdf(pdfId: number): Promise<ReindexResponse> {
+  return apiPost<ReindexResponse>(`/code-book-pdfs/${pdfId}/reindex`);
+}
+
 /**
  * Upload a PDF into the given code_book. The backend expects `code_book_id`
  * as a query param (not a form field). Uses XHR so we can report progress

@@ -1152,6 +1152,128 @@ async def download_book_pdf(pdf_id: int):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/code-book-pdfs/{pdf_id}/reindex")
+async def reindex_pdf(pdf_id: int):
+    """Re-parse an already-stored PDF without requiring a re-upload.
+
+    Used when:
+      - a prior parse was interrupted (e.g. backend restart mid-ingest)
+        so the PDF exists but no sections were ever produced
+      - the parser rules changed and you want to replay the file
+      - the indexed content drifted for any other reason
+
+    Pipeline: load bytes from code_book_pdfs, write to disk for the
+    parser, supersede any currently-live sections for this book, create
+    a fresh import_logs row, and fire import_svc.import_pdf in the
+    background. The caller polls /api/imports/{log_id} to watch progress
+    (same shape as a fresh upload).
+    """
+    try:
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """SELECT id, code_book_id, filename, content, size_bytes
+                     FROM code_book_pdfs WHERE id = $1""",
+                pdf_id,
+            )
+        if not row:
+            raise HTTPException(status_code=404, detail=f"PDF {pdf_id} not found")
+
+        code_book_id = row["code_book_id"]
+        filename = row["filename"] or f"{pdf_id}.pdf"
+        safe_name = os.path.basename(filename)
+
+        # Materialise bytes to /tmp so the parser (which takes a path)
+        # can read them. We drop the Python buffer before kicking off
+        # the async task so the full file isn't held in RAM for the
+        # lifetime of the parse.
+        pdf_bytes = bytes(row["content"])
+        temp_file_path = os.path.join(PDF_UPLOAD_DIR, safe_name)
+        with open(temp_file_path, "wb") as f:
+            f.write(pdf_bytes)
+        del pdf_bytes
+
+        async with db_pool.acquire() as conn:
+            book = await conn.fetchrow(
+                "SELECT id, code_name FROM code_books WHERE id = $1",
+                code_book_id,
+            )
+            if not book:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"code_book {code_book_id} not found",
+                )
+
+            # Supersede any current sections — same semantics as
+            # uploading new bytes. If there's nothing current (common
+            # for the interrupted-parse case) this is a no-op.
+            status_tag = await conn.execute(
+                """UPDATE code_sections
+                      SET superseded_date = CURRENT_DATE, updated_at = NOW()
+                    WHERE code_book_id = $1 AND superseded_date IS NULL""",
+                code_book_id,
+            )
+            try:
+                superseded_n = int(status_tag.split()[-1])
+            except (ValueError, IndexError):
+                superseded_n = 0
+
+            src = await conn.fetchrow(
+                """SELECT id FROM import_sources
+                    WHERE code_book_id = $1 AND source_type = 'pdf_parse'
+                    ORDER BY id DESC LIMIT 1""",
+                code_book_id,
+            )
+            if src:
+                source_id = src["id"]
+            else:
+                source_id = await conn.fetchval(
+                    """INSERT INTO import_sources
+                           (source_name, source_type, code_book_id, status)
+                       VALUES ($1, 'pdf_parse', $2, 'pending')
+                       RETURNING id""",
+                    f"PDF uploads: {book['code_name']}", code_book_id,
+                )
+
+            import_log_id = await conn.fetchval(
+                """INSERT INTO import_logs
+                       (source_id, code_book_id, pdf_id, filename,
+                        status, phase, imported_at, updated_at)
+                   VALUES ($1, $2, $3, $4, 'processing', 'queued', NOW(), NOW())
+                   RETURNING id""",
+                source_id, code_book_id, pdf_id, safe_name,
+            )
+
+        asyncio.create_task(
+            import_svc.import_pdf(
+                file_path=temp_file_path,
+                code_book_id=code_book_id,
+                db_pool=db_pool,
+                embedding_url=EMBEDDING_SERVICE_URL,
+                source_id=source_id,
+                import_log_id=import_log_id,
+                source_pdf_id=pdf_id,
+            )
+        )
+
+        logger.info(
+            "Re-index started: pdf_id=%s book=%s import_log_id=%s superseded=%s",
+            pdf_id, book["code_name"], import_log_id, superseded_n,
+        )
+        return {
+            "status": "queued",
+            "import_log_id": import_log_id,
+            "pdf_id": pdf_id,
+            "code_book_id": code_book_id,
+            "filename": safe_name,
+            "superseded_sections": superseded_n,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Re-index error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # --- Image review: render PDF pages on demand -----------------------------
 #
 # All three review endpoints open the stored bytes with PyMuPDF. Rendering

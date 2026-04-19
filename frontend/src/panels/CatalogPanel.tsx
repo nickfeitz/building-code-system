@@ -1,7 +1,13 @@
 import { useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useCatalog, useCatalogScan } from "../hooks/useCatalog";
-import { uploadPdf, ApiError, asDuplicate, type UploadProgress } from "../api/client";
+import {
+  uploadPdf,
+  ApiError,
+  asDuplicate,
+  reindexPdf,
+  type UploadProgress,
+} from "../api/client";
 import { ProgressBar } from "../components/ImportsTable";
 import type {
   CatalogAuthority,
@@ -56,10 +62,40 @@ function BookRow({
   const qc = useQueryClient();
   const fileInput = useRef<HTMLInputElement>(null);
   const [uploading, setUploading] = useState(false);
+  const [reindexing, setReindexing] = useState(false);
   const [progress, setProgress] = useState<UploadProgress | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
 
   const onPickFile = () => fileInput.current?.click();
+
+  const onReindex = async () => {
+    if (!book.latest_pdf_id || reindexing) return;
+    // Destructive on current sections — confirm once so users don't
+    // nuke a working book by mis-click.
+    if (book.indexed_section_count > 0) {
+      const ok = window.confirm(
+        `Re-parse "${book.code_name}"? This will mark the current ${book.indexed_section_count} indexed section${book.indexed_section_count === 1 ? "" : "s"} as superseded and replace them with a fresh parse of the stored PDF.`,
+      );
+      if (!ok) return;
+    }
+    setReindexing(true);
+    setMsg(null);
+    try {
+      const r = await reindexPdf(book.latest_pdf_id);
+      setMsg(`Re-index queued (import_log_id=${r.import_log_id}) · watch Imports`);
+      qc.invalidateQueries({ queryKey: ["imports"] });
+      qc.invalidateQueries({ queryKey: ["catalog"] });
+      qc.invalidateQueries({ queryKey: ["stats"] });
+    } catch (err) {
+      setMsg(
+        err instanceof ApiError
+          ? `Re-index failed (${err.status}): ${err.message}`
+          : String(err),
+      );
+    } finally {
+      setReindexing(false);
+    }
+  };
 
   const onFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0];
@@ -181,6 +217,17 @@ function BookRow({
           className="btn-ghost !py-1 !px-2 !text-xs shrink-0"
         >
           👁 Review
+        </button>
+      )}
+      {book.latest_pdf_id != null && (
+        <button
+          type="button"
+          onClick={onReindex}
+          disabled={reindexing}
+          title={`Re-parse the stored PDF for ${book.code_name}. Useful when a prior parse was interrupted or you want to replay after a parser change.`}
+          className="btn-ghost !py-1 !px-2 !text-xs shrink-0"
+        >
+          {reindexing ? "Queueing…" : "↻ Re-index"}
         </button>
       )}
       <button

@@ -1,3 +1,6 @@
+import { useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
+import { reindexPdf, ApiError } from "../api/client";
 import type { ImportJob } from "../api/types";
 
 function PhaseBadge({ phase, status }: { phase: string; status: string }) {
@@ -61,6 +64,41 @@ export function ProgressBar({ percent, phase }: { percent: number | null; phase:
   );
 }
 
+function ReindexButton({ pdfId }: { pdfId: number }) {
+  const qc = useQueryClient();
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const onClick = async () => {
+    if (busy) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      await reindexPdf(pdfId);
+      qc.invalidateQueries({ queryKey: ["imports"] });
+      qc.invalidateQueries({ queryKey: ["catalog"] });
+      qc.invalidateQueries({ queryKey: ["stats"] });
+    } catch (e) {
+      setErr(e instanceof ApiError ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <>
+      <button
+        type="button"
+        onClick={onClick}
+        disabled={busy}
+        className="underline hover:text-white disabled:opacity-50"
+        title="Re-parse the stored PDF for this book"
+      >
+        {busy ? "queueing…" : "re-index"}
+      </button>
+      {err && <span className="text-danger ml-2">{err}</span>}
+    </>
+  );
+}
+
 export function ImportsTable({
   rows,
   compact = false,
@@ -111,15 +149,20 @@ export function ImportsTable({
                 <span className="text-warn">⚠ {r.records_failed}</span>
               )}
               {r.pdf_id && (
-                <a
-                  className="underline hover:text-white ml-auto"
-                  href={`/api/code-book-pdfs/${r.pdf_id}/content`}
-                  target="_blank"
-                  rel="noreferrer"
-                  title="Download stored PDF"
-                >
-                  download
-                </a>
+                <span className="ml-auto flex items-center gap-3">
+                  {(r.phase === "failed" || r.phase === "completed") && (
+                    <ReindexButton pdfId={r.pdf_id} />
+                  )}
+                  <a
+                    className="underline hover:text-white"
+                    href={`/api/code-book-pdfs/${r.pdf_id}/content`}
+                    target="_blank"
+                    rel="noreferrer"
+                    title="Download stored PDF"
+                  >
+                    download
+                  </a>
+                </span>
               )}
             </div>
             {r.error_message && (
