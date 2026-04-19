@@ -4,6 +4,7 @@ Handles PDF parsing, validation, database insertion, embedding generation,
 and cross-reference extraction.
 """
 
+import asyncio
 import hashlib
 import logging
 import re
@@ -14,6 +15,7 @@ import httpx
 
 from parsers.document_extractor import DocumentExtractor
 from parsers.reference_extractor import ReferenceExtractor
+from parsers.text_normalizer import has_glyph_artifacts
 from validators.content_validator import ContentValidator
 
 
@@ -112,11 +114,46 @@ async def import_pdf(
                     source_id, 'processing', code_book_id, 'queued',
                 )
 
-        # Phase 1: PDF parse (TOC-driven extraction)
-        await _set_phase('parsing', status='processing')
+        # Phase 1: PDF parse (TOC-driven extraction). Runs on a worker
+        # thread via asyncio.to_thread so the event loop stays responsive
+        # during multi-minute OCR-heavy PDFs; a thread-safe progress
+        # callback schedules import_logs updates back on this loop so the
+        # UI bar moves while extraction runs instead of freezing on the
+        # "parsing" phase label.
+        await _set_phase('parsing', status='processing',
+                         records_total=0, records_processed=0)
         logger.info(f"Parsing PDF: {file_path}")
+
+        loop = asyncio.get_running_loop()
+
+        async def _record_extraction_progress(done: int, total: int) -> None:
+            if import_log_id is None:
+                return
+            try:
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        '''UPDATE import_logs
+                           SET records_total = $1,
+                               records_processed = $2,
+                               phase = 'parsing',
+                               updated_at = NOW()
+                         WHERE id = $3''',
+                        total, done, import_log_id,
+                    )
+            except Exception:
+                # UI-only update; never fail the ingest over it.
+                logger.exception("parsing progress update failed")
+
+        def _sync_progress_cb(done: int, total: int) -> None:
+            asyncio.run_coroutine_threadsafe(
+                _record_extraction_progress(done, total),
+                loop,
+            )
+
         extractor = DocumentExtractor()
-        extracted = extractor.extract(file_path)
+        extracted = await asyncio.to_thread(
+            extractor.extract, file_path, _sync_progress_cb,
+        )
         parsed_sections = extracted.sections
         logger.info(
             f"Extracted {len(parsed_sections)} sections from "
@@ -245,6 +282,35 @@ async def import_pdf(
                         normalized_hash,
                         canonical_id,
                     )
+
+                    # Glyph-suspect audit: after normalization the body
+                    # should be free of PDF custom-font artifacts. If any
+                    # slipped through, flag this section for human review
+                    # without blocking the insert — the reader can still
+                    # see what we extracted.
+                    if has_glyph_artifacts(section.full_text):
+                        try:
+                            import json as _json
+                            await conn.execute(
+                                '''INSERT INTO content_quarantine
+                                   (source_id, validation_layer, error_message,
+                                    raw_content, metadata)
+                                   VALUES ($1, $2, $3, $4, $5)''',
+                                source_id,
+                                2,  # layer 2 = garbage / encoding
+                                'Glyph-encoding artifacts remain after normalization',
+                                section.full_text[:5000],
+                                _json.dumps({
+                                    'reason': 'glyph_encoding_suspect',
+                                    'section_id': section_id,
+                                    'section_number': section.section_number,
+                                }),
+                            )
+                        except Exception as _e:
+                            logger.warning(
+                                "glyph-suspect quarantine failed for %s: %s",
+                                section.section_number, _e,
+                            )
 
                     # Generate embedding
                     embedding = await generate_embedding(

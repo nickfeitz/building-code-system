@@ -46,7 +46,7 @@ import logging
 import re
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import fitz  # PyMuPDF
 
@@ -122,7 +122,23 @@ class DocumentExtractor:
     def __init__(self, toc: Optional[TocExtractor] = None):
         self.toc = toc or TocExtractor()
 
-    def extract(self, pdf_path: str) -> ExtractedDocument:
+    def extract(
+        self,
+        pdf_path: str,
+        progress: Optional[Callable[[int, int], None]] = None,
+    ) -> ExtractedDocument:
+        """Extract all sections from ``pdf_path``.
+
+        Args:
+            pdf_path: Path to the PDF on disk.
+            progress: Optional callable ``(done_pages, total_pages)`` invoked
+                while pages are being text-extracted / OCR'd. Fires every
+                ~2% of pages, plus one final tick at ``(total, total)``.
+                The Imports UI wires this to update ``records_processed``
+                during the ``parsing`` phase so the bar moves instead of
+                freezing on the phase label — important for large scanned
+                PDFs whose extraction is OCR-bound and can take many minutes.
+        """
         result = ExtractedDocument()
 
         toc_entries = self.toc.extract(pdf_path)
@@ -135,7 +151,7 @@ class DocumentExtractor:
             result.page_count = len(doc)
 
             # Build per-page text once. Strip running headers/footers.
-            pages = self._extract_all_pages(doc, result)
+            pages = self._extract_all_pages(doc, result, progress=progress)
 
             # Iterate over TOC entries; slice body text between adjacent entries.
             for i, entry in enumerate(toc_entries):
@@ -195,6 +211,7 @@ class DocumentExtractor:
         self,
         doc: fitz.Document,
         result: ExtractedDocument,
+        progress: Optional[Callable[[int, int], None]] = None,
     ) -> List[str]:
         """Extract raw text per page, with running headers/footers stripped.
 
@@ -202,7 +219,12 @@ class DocumentExtractor:
         recorded in ``result.ocr_flagged_pages`` for downstream quarantine.
         """
         raw: List[List[str]] = []
-        for page_idx in range(len(doc)):
+        n = len(doc)
+        # Don't hammer the progress callback — ~50 evenly-spaced ticks
+        # across the whole PDF plus one final tick at the end is plenty
+        # for a UI bar.
+        tick_every = max(1, n // 50)
+        for page_idx in range(n):
             page = doc.load_page(page_idx)
             text = page.get_text() or ""
             if len(text.strip()) < self.MIN_TEXT_CHARS_PER_PAGE:
@@ -211,6 +233,15 @@ class DocumentExtractor:
                     text = ocr_text
                     result.ocr_flagged_pages.append(page_idx + 1)
             raw.append([ln for ln in text.splitlines() if ln.strip()])
+            if progress is not None and (
+                page_idx % tick_every == 0 or page_idx == n - 1
+            ):
+                try:
+                    progress(page_idx + 1, n)
+                except Exception:
+                    # Progress reporting is best-effort; never fail the
+                    # extraction over a UI-only update.
+                    logger.exception("progress callback raised; continuing")
 
         # Build a frequency table of top-3 and bottom-3 lines across pages.
         # A line that appears on > HEADER_FOOTER_THRESHOLD of pages is a

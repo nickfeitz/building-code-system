@@ -1,7 +1,8 @@
-import { useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { pdfPageImageUrl } from "../api/client";
 import type { CatalogBook } from "../api/types";
 import { useCatalog } from "../hooks/useCatalog";
+import { usePdfMeta } from "../hooks/useReview";
 import {
   useBookOutline,
   useBookPdfs,
@@ -201,10 +202,48 @@ function collapse(s: string): string {
 
 function isListItem(p: string): boolean {
   return (
-    /^(\d+\.\s)/.test(p) ||
+    /^(\d+[a-z]?\.\s)/.test(p) ||
     /^\(\s*[a-z0-9ivx]+\s*\)/i.test(p) ||
     /^[•◦·●]\s/.test(p)
   );
+}
+
+/**
+ * A formula line is a list-style item (numbered/lettered) whose body
+ * contains arithmetic operators or parentheses — i.e. the ASCE load
+ * combinations "1a. D + L", "6a. D + 0.75L + 0.75(…)", etc. We render
+ * these in monospace so the equation aligns visually.
+ */
+const _FORMULA_STARTER = /^\d+[a-z]?\.\s+[A-Z0-9(]/;
+const _FORMULA_OPERATOR = /[+\u2212=]|\(/; // +, −, =, (
+function isFormulaLine(p: string): boolean {
+  return _FORMULA_STARTER.test(p) && _FORMULA_OPERATOR.test(p);
+}
+
+/**
+ * Turn "W_T", "L_r", "S_DS" style tokens (emitted by the backend
+ * subscript restorer) into <span>X<sub>Y</sub></span>. Token shape:
+ * one to six capital letters, then "_", then one to three alphanum
+ * characters. Anything else stays literal.
+ */
+const _SUBSCRIPT_TOKEN_RE = /\b([A-Z][A-Za-z]{0,5})_([A-Za-z0-9]{1,3})\b/g;
+function renderWithSubscripts(text: string): ReactNode[] {
+  const parts: ReactNode[] = [];
+  let last = 0;
+  let m: RegExpExecArray | null;
+  let key = 0;
+  while ((m = _SUBSCRIPT_TOKEN_RE.exec(text)) !== null) {
+    if (m.index > last) parts.push(text.slice(last, m.index));
+    parts.push(
+      <span key={`s${key++}`}>
+        {m[1]}
+        <sub>{m[2]}</sub>
+      </span>,
+    );
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) parts.push(text.slice(last));
+  return parts;
 }
 
 /**
@@ -224,9 +263,16 @@ function linkifyRefs(
   let last = 0;
   let m: RegExpExecArray | null;
   let key = 0;
+  // Non-link segments are routed through renderWithSubscripts so "W_T"
+  // becomes W<sub>T</sub>; the link anchor text isn't subscript-rewritten
+  // because Section/Chapter/Figure identifiers never use underscores.
+  const pushText = (s: string) => {
+    if (!s) return;
+    for (const node of renderWithSubscripts(s)) parts.push(node);
+  };
   while ((m = regex.exec(text)) !== null) {
     const [full, , num] = m;
-    if (m.index > last) parts.push(text.slice(last, m.index));
+    if (m.index > last) pushText(text.slice(last, m.index));
     // Try direct hit, then "Chapter N" / "Figure X.Y" forms.
     const candidates = [
       num,
@@ -253,7 +299,7 @@ function linkifyRefs(
     }
     last = regex.lastIndex;
   }
-  if (last < text.length) parts.push(text.slice(last));
+  if (last < text.length) pushText(text.slice(last));
   return parts;
 }
 
@@ -654,31 +700,30 @@ function SectionBlock({
 
       {paragraphs.length > 0 && (
         <div className="mt-2 text-[15px] leading-7 text-surface-50 space-y-3">
-          {paragraphs.map((p, i) => (
-            <p key={i} className={isListItem(p) ? "pl-6 -indent-6" : ""}>
-              {linkifyRefs(p, refIndex, onJump)}
-            </p>
-          ))}
+          {paragraphs.map((p, i) => {
+            const formula = isFormulaLine(p);
+            const classes = formula
+              ? "pl-6 -indent-6 font-mono text-[14px] whitespace-pre-wrap"
+              : isListItem(p)
+                ? "pl-6 -indent-6"
+                : "";
+            return (
+              <p key={i} className={classes}>
+                {linkifyRefs(p, refIndex, onJump)}
+              </p>
+            );
+          })}
         </div>
       )}
 
       {pdfId != null && row.page_number != null && (
         <div className="mt-3 text-xs text-surface-100">
           {showPage ? (
-            <div>
-              <button
-                type="button"
-                className="btn-ghost text-xs mb-2"
-                onClick={() => setShowPage(false)}
-              >
-                Hide PDF page {row.page_number}
-              </button>
-              <img
-                src={pdfPageImageUrl(pdfId, row.page_number, 150)}
-                alt={`PDF page ${row.page_number}`}
-                className="border border-surface-400 rounded bg-white w-full"
-              />
-            </div>
+            <PdfPager
+              pdfId={pdfId}
+              startPage={row.page_number}
+              onClose={() => setShowPage(false)}
+            />
           ) : (
             <button
               type="button"
@@ -691,5 +736,219 @@ function SectionBlock({
         </div>
       )}
     </section>
+  );
+}
+
+/**
+ * Inline pager for the source PDF.
+ *
+ *   - Opens on the section's own ``page_number``; ◀ / ▶ walk adjacent pages.
+ *   - Zoom: − / + step through DPI presets, refetching a crisper PNG at
+ *     the new DPI. Keyboard ``-`` / ``+`` (or ``=``) also work.
+ *   - Loading bar: while the current page PNG is in flight, an indeterminate
+ *     progress stripe animates across the top of the image area. Clears on
+ *     ``<img onLoad>``.
+ *   - Keyboard: ``ArrowLeft`` / ``ArrowRight`` to page, ``-`` / ``+`` to
+ *     zoom, while the wrapper has focus (``tabIndex={0}``).
+ *   - Neighbor pages are prefetched at the current DPI so flips feel
+ *     instant once the browser has them cached.
+ */
+
+/** DPI presets. Kept in sync with the backend clamp (72–300). */
+const PDF_DPI_STEPS = [100, 125, 150, 200, 250, 300] as const;
+const PDF_DPI_DEFAULT = 150;
+
+function PdfPager({
+  pdfId,
+  startPage,
+  onClose,
+}: {
+  pdfId: number;
+  startPage: number;
+  onClose: () => void;
+}) {
+  const [page, setPage] = useState<number>(startPage);
+  const [dpi, setDpi] = useState<number>(PDF_DPI_DEFAULT);
+  const [loading, setLoading] = useState<boolean>(true);
+  const meta = usePdfMeta(pdfId);
+  const pageCount = meta.data?.page_count ?? null;
+
+  // If the caller swaps to a different section without unmounting us
+  // (e.g. breadcrumb navigation reusing the component), sync to the new
+  // starting page. Normal section switches unmount via <Reader key=…>.
+  useEffect(() => {
+    setPage(startPage);
+  }, [startPage]);
+
+  // Whenever page or zoom changes, the <img> is about to fetch a new
+  // URL. Flip loading true until onLoad fires.
+  useEffect(() => {
+    setLoading(true);
+  }, [page, dpi, pdfId]);
+
+  const clampedPage = (p: number) => {
+    if (p < 1) return 1;
+    if (pageCount != null && p > pageCount) return pageCount;
+    return p;
+  };
+  const goPrev = () => setPage((p) => clampedPage(p - 1));
+  const goNext = () => setPage((p) => clampedPage(p + 1));
+
+  const zoomIdx = PDF_DPI_STEPS.indexOf(dpi as (typeof PDF_DPI_STEPS)[number]);
+  const safeIdx = zoomIdx < 0 ? PDF_DPI_STEPS.indexOf(PDF_DPI_DEFAULT) : zoomIdx;
+  const atMinZoom = safeIdx <= 0;
+  const atMaxZoom = safeIdx >= PDF_DPI_STEPS.length - 1;
+  const zoomOut = () => {
+    if (!atMinZoom) setDpi(PDF_DPI_STEPS[safeIdx - 1]);
+  };
+  const zoomIn = () => {
+    if (!atMaxZoom) setDpi(PDF_DPI_STEPS[safeIdx + 1]);
+  };
+  const zoomReset = () => setDpi(PDF_DPI_DEFAULT);
+  const zoomPct = Math.round((dpi / PDF_DPI_DEFAULT) * 100);
+
+  const atStart = page <= 1;
+  const atEnd = pageCount != null && page >= pageCount;
+
+  return (
+    <div
+      tabIndex={0}
+      className="outline-none focus-visible:ring-1 focus-visible:ring-accent/60 rounded"
+      onKeyDown={(e) => {
+        if (e.key === "ArrowLeft") {
+          if (!atStart) goPrev();
+          e.preventDefault();
+        } else if (e.key === "ArrowRight") {
+          if (!atEnd) goNext();
+          e.preventDefault();
+        } else if (e.key === "+" || e.key === "=") {
+          if (!atMaxZoom) zoomIn();
+          e.preventDefault();
+        } else if (e.key === "-" || e.key === "_") {
+          if (!atMinZoom) zoomOut();
+          e.preventDefault();
+        } else if (e.key === "0") {
+          zoomReset();
+          e.preventDefault();
+        }
+      }}
+    >
+      <div className="flex items-center justify-between mb-2 gap-2 flex-wrap">
+        <button type="button" className="btn-ghost text-xs" onClick={onClose}>
+          Hide PDF page {page}
+        </button>
+
+        {/* Zoom controls */}
+        <div className="flex items-center gap-1">
+          <button
+            type="button"
+            className="px-2 py-0.5 rounded border border-surface-400 bg-surface-800 hover:bg-surface-700 disabled:opacity-40 disabled:cursor-not-allowed"
+            onClick={zoomOut}
+            disabled={atMinZoom}
+            aria-label="Zoom out"
+            title="Zoom out (−)"
+          >
+            −
+          </button>
+          <button
+            type="button"
+            className="px-2 py-0.5 rounded border border-surface-400 bg-surface-800 hover:bg-surface-700 min-w-[3.5rem] tabular-nums"
+            onClick={zoomReset}
+            aria-label={`Current zoom ${zoomPct}% — click to reset`}
+            title="Reset zoom (0)"
+          >
+            {zoomPct}%
+          </button>
+          <button
+            type="button"
+            className="px-2 py-0.5 rounded border border-surface-400 bg-surface-800 hover:bg-surface-700 disabled:opacity-40 disabled:cursor-not-allowed"
+            onClick={zoomIn}
+            disabled={atMaxZoom}
+            aria-label="Zoom in"
+            title="Zoom in (+)"
+          >
+            +
+          </button>
+        </div>
+
+        <div className="flex items-center gap-2">
+          {page !== startPage && (
+            <button
+              type="button"
+              className="underline hover:text-accent"
+              onClick={() => setPage(startPage)}
+              title="Return to the page this section starts on"
+            >
+              Back to page {startPage}
+            </button>
+          )}
+          <span>
+            Page {page}
+            {pageCount != null ? ` / ${pageCount}` : ""}
+          </span>
+        </div>
+      </div>
+
+      <div className="flex items-stretch gap-2">
+        <button
+          type="button"
+          className="px-2 py-1 rounded border border-surface-400 bg-surface-800 hover:bg-surface-700 disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
+          onClick={goPrev}
+          disabled={atStart}
+          aria-label="Previous page"
+        >
+          ◀
+        </button>
+
+        {/* Image + loading bar overlay. The bar is an animated stripe
+            pinned to the top of the image frame; it clears the instant
+            onLoad fires so users get fast visual feedback on cache hits
+            (neighbor prefetch) and a clear "still loading" signal on
+            zoom-up misses. */}
+        <div className="relative flex-1 min-w-0">
+          {loading && (
+            <div className="absolute top-0 left-0 right-0 h-1 overflow-hidden rounded-t">
+              <div className="h-full w-1/3 bg-accent/80 animate-[pdf-bar_1.1s_ease-in-out_infinite]" />
+            </div>
+          )}
+          <img
+            src={pdfPageImageUrl(pdfId, page, dpi)}
+            alt={`PDF page ${page}`}
+            onLoad={() => setLoading(false)}
+            onError={() => setLoading(false)}
+            className="border border-surface-400 rounded bg-white w-full object-contain"
+          />
+        </div>
+
+        <button
+          type="button"
+          className="px-2 py-1 rounded border border-surface-400 bg-surface-800 hover:bg-surface-700 disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
+          onClick={goNext}
+          disabled={atEnd}
+          aria-label="Next page"
+        >
+          ▶
+        </button>
+      </div>
+
+      {/* Prefetch neighbors at current zoom so page flips are instant.
+          Zero-sized, no layout impact. */}
+      {!atStart && (
+        <img
+          src={pdfPageImageUrl(pdfId, page - 1, dpi)}
+          alt=""
+          aria-hidden
+          className="w-0 h-0 opacity-0 pointer-events-none"
+        />
+      )}
+      {!atEnd && (
+        <img
+          src={pdfPageImageUrl(pdfId, page + 1, dpi)}
+          alt=""
+          aria-hidden
+          className="w-0 h-0 opacity-0 pointer-events-none"
+        />
+      )}
+    </div>
   );
 }
