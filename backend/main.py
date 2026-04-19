@@ -107,8 +107,12 @@ class SearchRequest(BaseModel):
 
 class SearchResult(BaseModel):
     id: int
-    title: str
-    content: str
+    # Canonical naming shared with HybridSearchResult + the catalog payload
+    # + the frontend's SectionSearchHit type. Previously this model used
+    # `title`/`content` which silently caused the Browser panel to show
+    # empty hit titles/bodies.
+    section_title: str
+    full_text: str
     code_book_id: int
     chapter: str
     section_number: str
@@ -116,8 +120,8 @@ class SearchResult(BaseModel):
 
 class SectionDetail(BaseModel):
     id: int
-    title: str
-    content: str
+    section_title: str
+    full_text: str
     code_book_id: int
     chapter: str
     section_number: str
@@ -703,8 +707,8 @@ async def search_sections(
             return [
                 SearchResult(
                     id=row['id'],
-                    title=row['section_title'] or '',
-                    content=row['full_text'][:500] if row['full_text'] else '',
+                    section_title=row['section_title'] or '',
+                    full_text=row['full_text'][:500] if row['full_text'] else '',
                     code_book_id=row['code_book_id'],
                     chapter=row['chapter'] or '',
                     section_number=row['section_number']
@@ -808,8 +812,8 @@ async def get_section(section_id: int):
 
             return SectionDetail(
                 id=row['id'],
-                title=row['section_title'] or '',
-                content=row['full_text'] or '',
+                section_title=row['section_title'] or '',
+                full_text=row['full_text'] or '',
                 code_book_id=row['code_book_id'],
                 chapter=row['chapter'] or '',
                 section_number=row['section_number'],
