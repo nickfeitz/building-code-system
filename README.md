@@ -1,111 +1,196 @@
 # Building Code System
 
-A self-hosted, UpCodes-style reader for building and engineering codes (ASCE, IBC, CBC, NEC, NFPA, …). Upload a code PDF once, the system parses the document's Table of Contents into a structured hierarchy, stores every section in PostgreSQL with vector embeddings, and exposes a browse-and-search UI that reads like a first-class digital edition of the code.
+A self-hosted reader for building and engineering codes — ASCE, IBC, CBC, NEC, NFPA, and friends — that turns a raw code PDF into a browsable, searchable, AI-queryable digital edition. Think **UpCodes, but on your own Postgres, with your own PDFs, with the source document always linked back**.
 
-The original PDF is preserved as backup and every section links back to its source page.
+## What the app does, in one screen
 
-## What it does
+Upload `ASCE-7-22.pdf`. A few minutes later you get:
 
-1. **Ingests code PDFs.** Upload a PDF via the Import panel (or REST API). The backend reads the PDF's own Table of Contents as ground truth, extracts body text per section via PyMuPDF, falls back to Tesseract OCR on sparse/scanned pages, strips running headers & footers, and stores each section — with its number, title, depth, page reference, chapter, and embedding vector — in Postgres.
-2. **Browses like UpCodes.** The Code Browser panel opens the outline of any indexed book. Clicking a chapter renders the whole chapter as one flowing document — chapter title, then every subsection inline, depth-indented, with section numbers as anchors and in-text references ("Section 26.5.2", "Chapter 31", "Figure 26.5-1B") as clickable links that jump inside the book.
-3. **Searches across codes.** Full-text search (Postgres `tsvector` + `pg_trgm`), plus a hybrid semantic + lexical endpoint backed by `intfloat/e5-large-v2` embeddings, scoped to a single book or the whole corpus.
-4. **Links duplicates across codes.** Sections with identical normalized text across different codes (common boilerplate, shared definitions) get a shared `canonical_section_id`, so the reader can see "this same provision also appears in X and Y."
-5. **Preserves sources.** Every uploaded PDF is stored in `code_book_pdfs` as bytea. Any section shows a "View PDF page N" link that renders the exact original page from that stored file.
-6. **AI chat.** A streaming `/api/chat` endpoint backed by local Ollama models (with an optional Anthropic Claude path) answers questions using the indexed codes as grounding. (Citation enforcement is iterating — treat output as a research aid, not a substitute for opening the book.)
-7. **Quality gates.** Every section goes through a 4-layer validator (format, garbage/OCR check, code-structure heuristic, integrity/dedup). Rejects land in a Quarantine panel for human review, and pages the user flags as bad extractions get routed into the same queue with the raw PyMuPDF text attached.
-8. **Live progress.** The Imports panel surfaces per-PDF parse/index progress in real time — total TOC entries, rows indexed, rows quarantined, current phase.
-9. **Web scraping (planned).** A scraper skeleton for ICC exists in `backend/scrapers/`. Phase 1 (PDF ingest) is the current focus; Phase 5 (web scrape + diff against PDF) is the next milestone.
+- A **hierarchical outline** of the whole standard — chapters, sections, subsections, appendices — that matches the printed Table of Contents, because the ingester reads the PDF's TOC and uses it as ground truth instead of guessing at structure.
+- A **reader view** that renders any chapter as one flowing document — chapter title, every subsection inline in document order, depth-indented, with section numbers as anchors. Soft line wraps from the PDF are collapsed into real prose; hyphenated wraps are repaired. Inline cross-references (`Section 26.5.2`, `Chapter 31`, `Figure 26.5-1B`, `Table 1.5-1`, `Appendix C`) are clickable and jump to the target within the same panel.
+- A **search bar** that does full-text (Postgres `tsvector` + `pg_trgm` fuzzy) and a hybrid semantic + lexical endpoint backed by `intfloat/e5-large-v2` embeddings, scoped to one book or the whole corpus.
+- A **"View PDF page" link** on every section that renders the exact original page as a PNG from the stored PDF bytes. Opt-in — you see clean code text first, not a PDF viewer.
+- An **AI chat** panel that talks to local Ollama models (gemma/qwen/mistral/deepseek) with the indexed codes as grounding, or Anthropic Claude if you drop in an API key.
+- A **quarantine queue** for sections that failed extraction validation, plus a page-level flag button in the Review panel — "this page came out wrong" — so you can re-OCR or hand-edit later.
+- A **live dashboard** showing ingest progress, quarantine counts, per-book indexed section counts.
+
+## The ingestion pipeline (how a PDF becomes code you can read)
+
+```
+   upload                   ┌──────────────────────────────────┐
+    PDF   ──►  backend  ──► │  1. Store raw bytes              │──► code_book_pdfs (bytea)
+            (FastAPI)       │  2. TOC discovery                │    fitz.get_toc() → visual fallback → OCR
+                            │  3. Page-target verification     │    validate each entry against page text
+                            │  4. Body slicing (per TOC entry) │    PyMuPDF + Tesseract fallback
+                            │  5. Running header/footer strip  │    frequency-based
+                            │  6. Text normalization           │ ──► store full_text (clean) + full_text_raw
+                            │  7. 4-layer content validation   │    format / garbage / structure / integrity
+                            │  8. Embed (E5-large-v2, 1024d)   │ ──► code_sections.embedding
+                            │  9. Cross-reference extraction   │ ──► code_references
+                            │  10. Canonical dedup across codes│ ──► code_sections.canonical_section_id
+                            └──────────────────────────────────┘
+```
+
+Every step is live-streamed into `import_logs` with a `phase` + counters, so the Imports panel shows an actual progress bar, not a spinner.
+
+### Why the text looks right
+
+PDFs encode visual line wraps, not semantic paragraphs — `page.get_text()` gives you
+`"The design wind loads for\nbuildings and other structures..."` with a newline mid-sentence. Step 6 in the pipeline **normalizes every section at ingest time**: soft wraps collapse to single spaces, hyphenated wraps rejoin into single words (`"build-\ning"` → `"building"`), and real paragraph boundaries survive — blank lines, numbered/lettered list items (`1.`, `2.`, `(a)`), bullets, and callouts (`EXCEPTION:`, `User Note:`, `COMMENTARY:`). The output goes into `code_sections.full_text` as clean prose; the untouched PDF extraction is preserved in `full_text_raw` for audit and re-normalization. Search, embeddings, chat context, and the browser all read `full_text`, so search matches like `"wind loads for buildings"` work even when that phrase straddled a page wrap in the original.
+
+Every future upload runs through the same normalization. Existing books are brought up to date with `python -m scripts.renormalize --book-id <N>`.
 
 ## Architecture
 
 ```
-                        ┌─────────────────┐
-  upload PDF ─► Import ─►  backend (8010) ─► Postgres 17 + pgvector
-                        │  FastAPI + asyncpg          │
-                        │  TOC + OCR + embeddings     │
-                        └──┬──────────────┬──────────┘
-                           │              │
-                           ▼              ▼
-                 embedding-service   Ollama (host)
-                   (E5-large-v2)     gemma/qwen/etc.
-                                          │
-  browser ─────► frontend (3010) ─► backend ◄──── scraper-service (8012)
-            nginx + React + Vite     /api/*       (phase 5, idle for now)
+                           ┌─────────────────────────┐
+  browser ─► frontend:3010 │ React + TS + Tailwind   │
+            (nginx proxy)  │ Panels: Browser / Chat  │
+                           │        Dashboard / …    │
+                           └──────────┬──────────────┘
+                                      │ /api/*
+                                      ▼
+                           ┌─────────────────────────┐
+                           │  backend:8010           │   Postgres 17
+                           │  FastAPI + asyncpg      │◄─ + pgvector
+                           │  - upload & parse       │   + pg_trgm
+                           │  - search / hybrid      │
+                           │  - chat (streaming)     │
+                           │  - reindex / quarantine │
+                           └──┬─────────────┬────────┘
+                              │             │
+                              ▼             ▼
+                     embedding:8011      Ollama (host)
+                     E5-large-v2         + optional Claude
+                     (1024-d vectors)
+                              
+                     scraper-service:8012  (Phase 5 — idle)
 ```
 
-- **backend** — FastAPI. PDF parsing in `backend/parsers/toc_extractor.py` + `document_extractor.py`. Orchestration in `backend/services/import_service.py`. Validation in `backend/validators/content_validator.py`. All endpoints live in `backend/main.py`.
-- **embedding-service** — dedicated container that loads sentence-transformers `intfloat/e5-large-v2` once and exposes `/embed`.
-- **frontend** — React + TypeScript + Tailwind. Key panels: `Dashboard`, `Catalog` (book list + scan triggers), `Import` (upload + progress), `Browser` (the reader — `frontend/src/panels/BrowserPanel.tsx`), `Review` (page-level QA with side-by-side image + text + flag), `Quarantine`, `Chat`.
-- **Postgres** — schema in `backend/schema.sql`; additive migrations in `backend/migrations/`. Core tables: `code_books`, `code_sections` (with `embedding vector(1024)`, `canonical_section_id`, `normalized_hash`, `page_number`, `source_pdf_id`), `code_book_pdfs` (source bytes), `code_references` (cross-refs), `import_logs`, `content_quarantine`.
+### Core tables
 
-## Ingestion pipeline (how a PDF becomes browsable code)
+| Table | Contents |
+|---|---|
+| `code_books` | One row per published edition (ASCE 7-22, CBC 2022, IBC 2021, …) with publisher + cycle. |
+| `code_book_pdfs` | Uploaded PDF bytes + SHA-256 + filename. Kept forever as the authoritative source. |
+| `code_sections` | Extracted sections: number, title, `full_text` (clean), `full_text_raw` (PDF), `depth`, `page_number`, `chapter`, `embedding vector(1024)`, `normalized_hash`, `canonical_section_id`. |
+| `code_section_versions` | Append-only version history per section. |
+| `code_references` | Cross-refs detected in body text (internal section → section, external → standard). |
+| `import_logs` / `import_sources` | Per-upload ingest state machine with phase + counters. |
+| `content_quarantine` | Content that failed validation, grouped by layer with metadata for manual review. |
+| `external_standards` / `topics` / `section_topics` | Auxiliary metadata. |
 
-1. **Upload** via `POST /api/import/upload` — bytes stored in `code_book_pdfs`, returning `import_log_id`.
-2. **TOC discovery** — `TocExtractor` reads `fitz.get_toc()`; if the embedded outline is absent or too short, it visually parses leader-dot rows on the front-matter pages (with Tesseract OCR as a final fallback for scanned TOC pages).
-3. **Page-target verification** — each outline entry's claimed page is validated against the actual heading text on that page; mismatches (common in PDFs whose outline points at commentary links instead of body pages) are corrected by searching forward from the last trusted entry.
-4. **Body slicing** — `DocumentExtractor` concatenates pages in each TOC entry's range, strips running headers/footers by frequency, skips fronts-matter sections (Preface, Index, Commentary), and keeps the body text between this heading and the next one.
-5. **Validation** — 4 layers: format (empty/binary/mojibake), garbage (web-scrape heuristics only on web sources, never on PDFs), code-structure (soft signal, doesn't hard-fail), integrity (dedup vs. live rows + truncation checks).
-6. **Insert** — section rows, version history, embedding call to the embedding-service, cross-reference extraction, canonical-link to any existing section with the same normalized hash.
-7. **Progress** — `import_logs.phase` + counters update every ~2% so the UI can show a live bar.
+### Vector + text search
 
-## Validation state
-
-Validated end-to-end against ASCE/SEI 7-22 (1,046 pages, 188 MB PDF): **2,129 sections indexed from 2,526 TOC entries (84%)**. Chapter 26 (Wind Loads) fully recovered with real section bodies, correct page attribution, and working cross-references to Chapter 27 / 31 / Figure 26.5-1B etc. The ~16% gap is mostly legitimate duplicates and short boilerplate rejected by integrity validation; relaxing those rules further is the next follow-up.
+- `code_sections.embedding` is HNSW-indexed (`vector_cosine_ops`) for k-NN semantic search.
+- `code_sections.full_text` has a `gin_trgm_ops` index for fuzzy matching and a `to_tsvector('english', full_text)` GIN for classic FTS.
+- `/api/sections/search` does lexical with ILIKE + filters; `/api/sections/hybrid-search` blends trigram + embedding similarity.
 
 ## Quick start
 
-Requires Docker, Docker Compose, and an existing `postgres-stack_default` network with a Postgres 17 container that has `pgvector` and `pg_trgm`.
+Requires Docker, Docker Compose, and an existing `postgres-stack_default` network with a Postgres 17 container that has `pgvector` and `pg_trgm` installed.
 
 ```bash
-# One-time: create the dedicated database
-docker exec postgres psql -U postgres -c "CREATE DATABASE building_code OWNER postgres;"
+# One-time database setup
+docker exec postgres psql -U postgres -c \
+  "CREATE DATABASE building_code OWNER postgres;"
 docker exec postgres psql -U postgres -d building_code -c \
   "CREATE EXTENSION IF NOT EXISTS vector; CREATE EXTENSION IF NOT EXISTS pg_trgm;"
 docker exec -i postgres psql -U postgres -d building_code < backend/schema.sql
-docker exec -i postgres psql -U postgres -d building_code < backend/migrations/001_dedup_columns.sql
+for m in backend/migrations/*.sql; do
+  docker exec -i postgres psql -U postgres -d building_code < "$m"
+done
 
 # Build + run
-cp .env.example .env   # then set CLAUDE_API_KEY if you want the Claude path
+cp .env.example .env     # set CLAUDE_API_KEY if you want the Claude path
 docker compose up -d --build
 ```
 
 Services:
-- **Frontend** http://localhost:3010
-- **Backend API** http://localhost:8010 (OpenAPI at `/openapi.json`)
-- **Embedding** http://localhost:8011/health
-- **Scraper** http://localhost:8012 (idle until Phase 5)
+| URL | What |
+|---|---|
+| http://localhost:3010 | Frontend (open this) |
+| http://localhost:8010 | Backend API (`/openapi.json` for the spec) |
+| http://localhost:8011 | Embedding service |
+| http://localhost:8012 | Scraper service (Phase 5 — idle) |
+
+### Upload your first code
+
+1. Open http://localhost:3010, go to the **Catalog** panel.
+2. Find or create the book row (`ASCE/SEI 7-22`, etc.), click **Upload PDF**.
+3. Watch the **Imports** panel — it streams parse phases, TOC count, and rows indexed.
+4. When done, switch to the **Browser** panel, pick the book, click any chapter, read.
 
 ## Project layout
 
 ```
 backend/
-  main.py                       # FastAPI app — every endpoint
+  main.py                       # FastAPI app — every HTTP endpoint
   schema.sql                    # initial schema
-  migrations/                   # additive migrations (numbered)
+  migrations/                   # numbered, additive, idempotent
   parsers/
-    toc_extractor.py            # Stage A — outline discovery + verification
+    toc_extractor.py            # Stage A — outline discovery + page verification
     document_extractor.py       # Stage B/C — body slicing + header scrub
+    text_normalizer.py          # soft-wrap collapse, list preservation, hyphen repair
     reference_extractor.py      # cross-ref detection in body text
-    pdf_parser.py               # legacy Title 24 parser (retained, unused)
-  services/import_service.py    # ingest orchestration + embeddings + dedup
+    pdf_parser.py               # legacy Title-24 parser (retained, unused)
+  services/import_service.py    # ingest orchestration: validate → insert → embed → dedup
   validators/content_validator.py  # 4-layer validation pipeline
-  scrapers/                     # Phase 5 — ICC scraper skeleton
+  scripts/
+    renormalize.py              # backfill: re-normalize + re-embed existing rows
+  scrapers/                     # Phase 5 — ICC / gov-source scrapers (skeletal)
+
 embedding-service/              # E5-large-v2 sidecar (FastAPI + sentence-transformers)
+
 frontend/
   src/
-    panels/                     # Browser, Import, Catalog, Review, Chat, Dashboard, Quarantine
-    hooks/                      # useBrowser, useCatalog, useImports, useReview, useChat, …
+    panels/                     # Browser, Import, Catalog, Review, Chat,
+                                # Dashboard, Quarantine
+    hooks/                      # useBrowser, useCatalog, useImports,
+                                # useReview, useChat, useHealth, useStats
     api/                        # typed fetch client + response shapes
+
 docker-compose.yml
 .env
-STARTUP.md                      # detailed operational guide
+STARTUP.md                      # operational deep-dive
 ```
+
+## Development
+
+- **Re-ingest a PDF** (after parser or normalizer changes):
+  ```bash
+  curl -X POST http://localhost:8010/api/code-book-pdfs/{pdf_id}/reindex
+  ```
+- **Re-normalize existing rows** (after just text-reflow changes — no re-ingest needed):
+  ```bash
+  docker exec backend python -m scripts.renormalize --book-id 148
+  # or: --all-stale to catch any book with NULL full_text_raw
+  # or: --no-embed for a dry-run that skips the embedding-service calls
+  ```
+- **Tail ingest logs** per service:
+  ```bash
+  docker compose logs -f backend
+  ```
+- **Hot-iterate on frontend**: mount the source, run `npm run dev` in `frontend/`, or `docker compose build frontend && docker compose up -d --force-recreate frontend` for a full production build.
+
+## Validation state
+
+Validated end-to-end against **ASCE/SEI 7-22** (1,046 pages, 188 MB PDF):
+
+- **2,129 sections indexed** from **2,526 TOC entries** (84%).
+- Chapter 26 (Wind Loads) fully recovered: real section titles, real body prose, page numbers attribute to actual PDF pages (clickable "View PDF page 322" for 26.1 etc.).
+- Cross-references inside body text resolve to sibling sections (`Chapter 31`, `Section 26.12.3.2`, `Figure 26.5-1B`).
+- Remaining ~16% are quarantined as short boilerplate / near-duplicates by the existing integrity validator; tightening that threshold is the next follow-up.
 
 ## Roadmap
 
-- ✅ **Phase 1 — PDF ingestion.** TOC-driven extractor, OCR fallback, dedup infrastructure, validated against ASCE 7-22.
-- ✅ **Phase 2/3 — Database + Browser UI.** Schema with vector + trigram indexes; UpCodes-style single-window reader with inline reference linking.
-- ⏳ **Phase 4 — Close the 16% validation gap.** Stop quarantining legitimate short sections and duplicate boilerplate within a single book.
-- ⏳ **Phase 5 — Web scraping.** ICC + gov-source scrapers. When a web version is newer than the PDF, it becomes the displayed text; PDF remains the backup.
-- ⏳ **Phase 6 — AI chat with enforced citations.** Already streaming against local LLMs + optional Claude; needs hard citation grounding before code answers should be relied on.
-- ⏳ **Phase 7 — Dashboard polish.** Per-book coverage, quarantine trends, cross-code duplicate explorer.
+- ✅ **Phase 1 — PDF ingestion.** TOC-driven extractor, OCR fallback, canonical dedup, normalization. Validated against ASCE 7-22.
+- ✅ **Phase 2/3 — Database + Browser UI.** Hierarchical schema, vector + trigram indexes, UpCodes-style single-window reader with inline reference linking.
+- ⏳ **Phase 4 — Close the 16% validation gap.** Relax within-book dedup + "insufficient code structure" rejections for legitimate short sections.
+- ⏳ **Phase 5 — Web scraping.** ICC + gov-source scrapers. When a web version is newer than the PDF, the web text becomes authoritative for display; the PDF remains the permanent backup.
+- ⏳ **Phase 6 — AI chat with enforced citations.** Streaming already works; needs hard citation grounding so answers always reference `code_book_id + section_number` and never hallucinate a section.
+- ⏳ **Phase 7 — Dashboard polish.** Per-book coverage, quarantine trends, cross-code duplicate explorer, re-ingest from the UI with one click.
+
+## License
+
+Personal project; no license file yet. If you'd like to use or fork, open an issue.

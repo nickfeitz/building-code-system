@@ -218,17 +218,22 @@ async def import_pdf(
                     section_id = await conn.fetchval(
                         '''INSERT INTO code_sections
                            (code_book_id, chapter, section_number, section_title,
-                            full_text, section_type, depth, path, has_ca_amendment,
-                            amendment_agency, source_hash, page_number, source_pdf_id,
-                            normalized_hash, canonical_section_id)
-                           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                                   $13, $14, $15)
+                            full_text, full_text_raw, section_type, depth, path,
+                            has_ca_amendment, amendment_agency, source_hash,
+                            page_number, source_pdf_id, normalized_hash,
+                            canonical_section_id)
+                           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+                                   $12, $13, $14, $15, $16)
                            RETURNING id''',
                         code_book_id,
                         section.chapter,
                         section.section_number,
                         section.section_title,
                         section.full_text,
+                        # Preserve the untouched PDF extraction next to
+                        # the normalized version for auditability and
+                        # future reflow-logic regressions.
+                        getattr(section, "full_text_raw", None),
                         section.section_type,
                         section.depth,
                         section.path,

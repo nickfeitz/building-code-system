@@ -50,6 +50,7 @@ from typing import List, Optional, Tuple
 
 import fitz  # PyMuPDF
 
+from parsers.text_normalizer import normalize as _normalize_text
 from parsers.toc_extractor import TocEntry, TocExtractor, _ocr_page
 
 logger = logging.getLogger(__name__)
@@ -73,12 +74,17 @@ _NON_CODE_TITLES = re.compile(
 class ParsedSection:
     """Section record compatible with ``import_service.import_pdf``.
 
+    ``full_text``     — normalized prose (soft wraps collapsed, lists kept).
+                         This is what search, embeddings, and the UI read.
+    ``full_text_raw`` — untouched text as extracted from the PDF, for audit.
+
     Fields mirror those used by the existing insert loop. Added vs. the old
     parser: ``canonical_hash`` (normalized full-text hash used for dedup).
     """
     section_number: str
     section_title: str
     full_text: str
+    full_text_raw: Optional[str] = None
     chapter: Optional[str] = None
     depth: int = 0
     path: Optional[str] = None
@@ -159,10 +165,17 @@ class DocumentExtractor:
                     else self._infer_section_type(entry)
                 )
 
+                raw_body = body[: self.MAX_SECTION_CHARS]
+                clean_body = _normalize_text(
+                    raw_body,
+                    section_number=entry.section_number,
+                    section_title=entry.title,
+                )
                 result.sections.append(ParsedSection(
                     section_number=entry.section_number,
                     section_title=entry.title or f"Section {entry.section_number}",
-                    full_text=body[: self.MAX_SECTION_CHARS],
+                    full_text=clean_body,
+                    full_text_raw=raw_body,
                     chapter=_chapter_for(entry),
                     depth=entry.depth,
                     path=None,  # built later by import_service if needed
