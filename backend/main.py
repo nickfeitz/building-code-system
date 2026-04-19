@@ -1389,7 +1389,11 @@ async def pdf_page_text(pdf_id: int, page: int):
 async def list_book_sections(
     book_id: int,
     page: int | None = Query(None, description="Filter to sections on a specific page"),
-    limit: int = Query(50, ge=1, le=500),
+    # The Browser panel needs the full outline (2k+ sections for ASCE 7-22)
+    # to render a tree, so the upper bound had to grow. Payload is ~2MB
+    # uncached and cached aggressively by react-query client-side.
+    limit: int = Query(50, ge=1, le=5000),
+    outline: bool = Query(False, description="Return tree-outline shape only: drops full_text to keep payload small."),
 ):
     """List sections for a code book, optionally filtered by source page.
 
@@ -1428,7 +1432,10 @@ async def list_book_sections(
                 "id": r["id"],
                 "section_number": r["section_number"],
                 "section_title": r["section_title"],
-                "full_text": r["full_text"],
+                # In outline mode, drop the body text — the Browser panel
+                # fetches it lazily per-click via /api/sections/{id}, and
+                # a 2k-section list is ~2MB smaller without it.
+                "full_text": None if outline else r["full_text"],
                 "depth": r["depth"],
                 "page_number": r["page_number"],
                 "has_ca_amendment": r["has_ca_amendment"],

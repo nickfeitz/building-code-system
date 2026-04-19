@@ -6,14 +6,25 @@ and cross-reference extraction.
 
 import hashlib
 import logging
+import re
 from dataclasses import dataclass
 from typing import Optional
 import asyncpg
 import httpx
 
-from parsers.pdf_parser import PDFParser
+from parsers.document_extractor import DocumentExtractor
 from parsers.reference_extractor import ReferenceExtractor
 from validators.content_validator import ContentValidator
+
+
+def _normalize_for_dedup(text: str) -> str:
+    """Whitespace-collapsed lowercase body text used for canonical-section dedup.
+
+    Two sections from different codes that carry the same boilerplate
+    (e.g. identical scope paragraphs) will hash to the same value and get
+    linked via canonical_section_id instead of being inserted twice.
+    """
+    return re.sub(r"\s+", " ", (text or "").lower()).strip()
 
 logger = logging.getLogger(__name__)
 
@@ -101,12 +112,40 @@ async def import_pdf(
                     source_id, 'processing', code_book_id, 'queued',
                 )
 
-        # Phase 1: PDF parse
+        # Phase 1: PDF parse (TOC-driven extraction)
         await _set_phase('parsing', status='processing')
         logger.info(f"Parsing PDF: {file_path}")
-        parser = PDFParser()
-        parsed_sections = parser.parse(file_path)
-        logger.info(f"Extracted {len(parsed_sections)} sections")
+        extractor = DocumentExtractor()
+        extracted = extractor.extract(file_path)
+        parsed_sections = extracted.sections
+        logger.info(
+            f"Extracted {len(parsed_sections)} sections from "
+            f"{len(extracted.toc_entries)} TOC entries; "
+            f"{len(extracted.ocr_flagged_pages)} OCR-flagged pages"
+        )
+
+        # Push OCR-flagged pages into quarantine so the review UI surfaces
+        # them for human eyes.
+        if extracted.ocr_flagged_pages:
+            import json as _json
+            async with db_pool.acquire() as conn:
+                for page_num in extracted.ocr_flagged_pages:
+                    await conn.execute(
+                        '''INSERT INTO content_quarantine
+                           (source_id, validation_layer, error_message,
+                            raw_content, metadata)
+                           VALUES ($1, $2, $3, $4, $5)''',
+                        source_id,
+                        1,  # layer 1 = format/OCR
+                        'Page text layer too sparse; OCR fallback invoked',
+                        f'page {page_num} of {file_path}',
+                        _json.dumps({
+                            'reason': 'ocr_needed',
+                            'pdf_page': page_num,
+                            'source_pdf_id': source_pdf_id,
+                        }),
+                    )
+
         await _set_phase('indexing',
                          records_total=len(parsed_sections),
                          records_processed=0)
@@ -136,8 +175,12 @@ async def import_pdf(
                 except Exception:
                     pass  # progress update failures must not break the import
             try:
-                # Validate content
-                validation = await content_validator.validate(section.full_text, source_id)
+                # Validate content. source_type="pdf" disables the
+                # web-scrape Layer-2 heuristics that produce false
+                # positives on legitimate building-code prose.
+                validation = await content_validator.validate(
+                    section.full_text, source_id, source_type="pdf",
+                )
                 if not validation.passed:
                     result.quarantined += 1
                     logger.warning(
@@ -145,16 +188,41 @@ async def import_pdf(
                     )
                     continue
 
-                # Insert section into database
+                # Hash body text two ways:
+                #   source_hash      — exact hash of the body as extracted
+                #                      (used to detect "same PDF re-ingested")
+                #   normalized_hash  — whitespace-collapsed lowercase
+                #                      (used to link canonical cross-code
+                #                       duplicates via canonical_section_id)
                 section_hash = hashlib.sha256(section.full_text.encode()).hexdigest()
+                normalized_hash = hashlib.sha256(
+                    _normalize_for_dedup(section.full_text).encode()
+                ).hexdigest()
 
                 async with db_pool.acquire() as conn:
+                    # If another section in *any* code has the same
+                    # normalized body, link to it as the canonical version
+                    # so we're not storing the same paragraph twice across
+                    # the corpus. Same code_book re-imports don't match
+                    # themselves because we just cleared this book's rows
+                    # before reindex.
+                    canonical_id = await conn.fetchval(
+                        '''SELECT id FROM code_sections
+                           WHERE normalized_hash = $1
+                             AND code_book_id <> $2
+                           LIMIT 1''',
+                        normalized_hash,
+                        code_book_id,
+                    )
+
                     section_id = await conn.fetchval(
                         '''INSERT INTO code_sections
                            (code_book_id, chapter, section_number, section_title,
                             full_text, section_type, depth, path, has_ca_amendment,
-                            amendment_agency, source_hash, page_number, source_pdf_id)
-                           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                            amendment_agency, source_hash, page_number, source_pdf_id,
+                            normalized_hash, canonical_section_id)
+                           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                                   $13, $14, $15)
                            RETURNING id''',
                         code_book_id,
                         section.chapter,
@@ -169,6 +237,8 @@ async def import_pdf(
                         section_hash,
                         section.page_number,
                         source_pdf_id,
+                        normalized_hash,
+                        canonical_id,
                     )
 
                     # Generate embedding

@@ -167,57 +167,77 @@ class GarbageDetector:
         r'(?:account|login|password)',
     ]
 
-    def validate(self, content: str) -> Optional[ValidationResult]:
+    def validate(
+        self,
+        content: str,
+        source_type: str = "web",
+    ) -> Optional[ValidationResult]:
         """Detect garbage content.
+
+        The error-page / CAPTCHA / paywall / ICC-cart patterns only make
+        sense for web-scraped content. Applying them to PDF-extracted
+        building-code text produces false positives — ASCE 7-22 sections
+        legitimately contain words like "order", "address", "purchase",
+        and numbers like "404" (e.g. "ASTM 404"), "500" (e.g. "concrete
+        strength 500 psi") that would trip these rules.
 
         Args:
             content: Content to validate
+            source_type: "pdf" to skip web-only heuristics, "web" otherwise
 
         Returns:
             None if valid, ValidationResult if garbage detected
         """
         errors = []
         content_lower = content.lower()
+        is_web = source_type != "pdf"
 
-        # Check for error pages
-        for pattern in self.ERROR_PATTERNS:
-            if re.search(pattern, content_lower):
-                errors.append(f"Error page pattern detected: {pattern}")
-                return ValidationResult(
-                    passed=False,
-                    layer=2,
-                    errors=errors,
-                )
+        # Check for error pages (web only — digits like 404/500 appear in
+        # ASTM standard numbers and engineering values inside PDFs)
+        if is_web:
+            for pattern in self.ERROR_PATTERNS:
+                if re.search(pattern, content_lower):
+                    errors.append(f"Error page pattern detected: {pattern}")
+                    return ValidationResult(
+                        passed=False,
+                        layer=2,
+                        errors=errors,
+                    )
 
-        # Check for CAPTCHAs
-        for pattern in self.CAPTCHA_PATTERNS:
-            if re.search(pattern, content_lower):
-                errors.append("CAPTCHA detected")
-                return ValidationResult(
-                    passed=False,
-                    layer=2,
-                    errors=errors,
-                )
+        # Check for CAPTCHAs (web only)
+        if is_web:
+            for pattern in self.CAPTCHA_PATTERNS:
+                if re.search(pattern, content_lower):
+                    errors.append("CAPTCHA detected")
+                    return ValidationResult(
+                        passed=False,
+                        layer=2,
+                        errors=errors,
+                    )
 
-        # Check for paywalls
-        for pattern in self.PAYWALL_PATTERNS:
-            if re.search(pattern, content_lower):
-                errors.append("Paywall detected")
-                return ValidationResult(
-                    passed=False,
-                    layer=2,
-                    errors=errors,
-                )
+        # Check for paywalls (web only — "premium" / "subscribe" appear in
+        # building-code boilerplate too)
+        if is_web:
+            for pattern in self.PAYWALL_PATTERNS:
+                if re.search(pattern, content_lower):
+                    errors.append("Paywall detected")
+                    return ValidationResult(
+                        passed=False,
+                        layer=2,
+                        errors=errors,
+                    )
 
-        # Check for ICC-specific garbage
-        for pattern in self.ICC_GARBAGE:
-            if re.search(pattern, content_lower):
-                errors.append(f"ICC garbage detected: {pattern}")
-                return ValidationResult(
-                    passed=False,
-                    layer=2,
-                    errors=errors,
-                )
+        # Check for ICC-specific garbage (web only — every PDF has "order"
+        # somewhere in legitimate prose)
+        if is_web:
+            for pattern in self.ICC_GARBAGE:
+                if re.search(pattern, content_lower):
+                    errors.append(f"ICC garbage detected: {pattern}")
+                    return ValidationResult(
+                        passed=False,
+                        layer=2,
+                        errors=errors,
+                    )
 
         # Check HTML tag ratio
         html_tags = len(re.findall(r'<[^>]+>', content))
@@ -352,11 +372,17 @@ class IntegrityValidator:
         content_hash = hashlib.sha256(content.encode()).hexdigest()
         metadata['content_hash'] = content_hash
 
-        # Check for duplicate content
+        # Check for duplicate content against LIVE sections only.
+        # Superseded rows are being replaced by this very ingest, so
+        # matching against them would false-flag every single section
+        # on a reindex (where every new row is by design a replacement
+        # for an existing superseded row with the same body text).
         try:
             async with db_pool.acquire() as conn:
                 existing = await conn.fetchval(
-                    'SELECT COUNT(*) FROM code_sections WHERE source_hash = $1',
+                    '''SELECT COUNT(*) FROM code_sections
+                        WHERE source_hash = $1
+                          AND superseded_date IS NULL''',
                     content_hash
                 )
                 if existing:
@@ -467,12 +493,16 @@ class ContentValidator:
         self,
         content: str,
         source_id: int,
+        source_type: str = "web",
     ) -> ValidationResult:
         """Run 4-layer validation pipeline.
 
         Args:
             content: Content to validate
             source_id: Import source ID
+            source_type: "pdf" or "web". Controls which Layer-2 patterns
+                are applied — web-scrape garbage heuristics fire false
+                positives on legitimate PDF body text.
 
         Returns:
             ValidationResult with passed/failed status
@@ -485,7 +515,7 @@ class ContentValidator:
             return result
 
         # Layer 2: Garbage detection
-        result = self.garbage_detector.validate(content)
+        result = self.garbage_detector.validate(content, source_type=source_type)
         if result:
             logger.warning(f"Content failed Layer 2 validation: {result.errors}")
             await self._quarantine(result, content, source_id)
@@ -520,6 +550,7 @@ class ContentValidator:
             content: Content that failed
             source_id: Import source ID
         """
+        import json
         try:
             async with self.db_pool.acquire() as conn:
                 await conn.execute(
@@ -530,7 +561,10 @@ class ContentValidator:
                     result.layer,
                     ' | '.join(result.errors),
                     content[:5000],  # Limit stored content
-                    str(result.metadata),
+                    # metadata is a JSONB column — json.dumps, not str().
+                    # str() produces Python repr ("{'key': 'val'}") which
+                    # postgres rejects as invalid JSON.
+                    json.dumps(result.metadata) if result.metadata else '{}',
                 )
         except Exception as e:
             logger.error(f"Error quarantining content: {e}")

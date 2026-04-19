@@ -4,10 +4,19 @@ WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
+    tesseract-ocr \
+    tesseract-ocr-eng \
+    poppler-utils \
+    libgl1 \
+    libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
 RUN pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt
+
+# Pre-fetch Docling models at build time so the first request doesn't stall.
+# Docling caches layout/OCR models under ~/.cache/docling by default.
+RUN python -c "from docling.document_converter import DocumentConverter; DocumentConverter()" || true
 
 COPY . .
 
