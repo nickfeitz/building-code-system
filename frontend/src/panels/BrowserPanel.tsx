@@ -503,6 +503,13 @@ export function BrowserPanel() {
             pdfId={pdfId}
             allRows={outline.data ?? []}
             onJump={setSelectedId}
+            bookLabel={
+              indexed.find((i) => i.book.id === effectiveBookId)?.book
+                .abbreviation ||
+              indexed.find((i) => i.book.id === effectiveBookId)?.book
+                .code_name ||
+              null
+            }
           />
         </div>
       )}
@@ -580,12 +587,14 @@ function Reader({
   pdfId,
   allRows,
   onJump,
+  bookLabel,
 }: {
   node: TreeNode;
   breadcrumbs: OutlineRow[];
   pdfId: number | null;
   allRows: OutlineRow[];
   onJump: (id: number) => void;
+  bookLabel: string | null;
 }) {
   const rows = useMemo(() => flattenSubtree(node), [node]);
   const baseDepth = rows[0]?.depth ?? 0;
@@ -604,24 +613,44 @@ function Reader({
     return m;
   }, [allRows]);
 
+  // Cross-reference click handler. If the target is already rendered
+  // inside this chapter view, scroll smoothly to its anchor; otherwise
+  // fall back to onJump() which swaps the whole reader subtree.
+  const inViewIds = useMemo(() => new Set(rows.map((r) => r.id)), [rows]);
+  const handleJump = (id: number) => {
+    if (inViewIds.has(id)) {
+      const el = document.getElementById(`sec-${id}`);
+      if (el) {
+        el.scrollIntoView({ behavior: "smooth", block: "start" });
+        return;
+      }
+    }
+    onJump(id);
+  };
+
   return (
-    <div className="max-w-3xl mx-auto px-6 py-8">
-      {/* Breadcrumb */}
-      {breadcrumbs.length > 1 && (
-        <nav className="text-xs text-surface-100 mb-4 flex flex-wrap gap-1 items-center">
+    <div className="max-w-[72ch] mx-auto px-8 py-10 text-[17px] leading-[1.75]">
+      {/* Breadcrumb — book abbreviation prefix, then the chapter/section trail */}
+      {(bookLabel || breadcrumbs.length > 1) && (
+        <nav className="text-sm text-surface-100 mb-8 flex flex-wrap gap-x-2 gap-y-1 items-baseline">
+          {bookLabel && (
+            <span className="text-xs font-semibold uppercase tracking-widest text-surface-200">
+              {bookLabel}
+            </span>
+          )}
           {breadcrumbs.map((b, i) => (
-            <span key={b.id} className="flex items-center gap-1">
-              {i > 0 && <span className="text-surface-200">/</span>}
+            <span key={b.id} className="flex items-baseline gap-2">
+              <span className="text-surface-200">·</span>
               {i < breadcrumbs.length - 1 ? (
                 <button
                   type="button"
-                  className="hover:text-accent underline-offset-2 hover:underline"
-                  onClick={() => onJump(b.id)}
+                  className="hover:text-accent underline-offset-2 hover:underline tabular-nums"
+                  onClick={() => handleJump(b.id)}
                 >
                   {b.section_number}
                 </button>
               ) : (
-                <span className="text-surface-50">{b.section_number}</span>
+                <span className="text-surface-50 tabular-nums">{b.section_number}</span>
               )}
             </span>
           ))}
@@ -634,27 +663,34 @@ function Reader({
           key={row.id}
           row={row}
           isRoot={row.section_number === rootNumber}
-          indent={Math.max(0, row.depth - baseDepth)}
+          relativeDepth={Math.max(0, row.depth - baseDepth)}
           pdfId={pdfId}
           refIndex={refIndex}
-          onJump={onJump}
+          onJump={handleJump}
         />
       ))}
     </div>
   );
 }
 
+/** DOM-safe slug of a section_number. "26.1.2.1" → "26-1-2-1". */
+function slugifySectionNumber(s: string): string {
+  return s.trim().replace(/[^A-Za-z0-9]+/g, "-").replace(/^-|-$/g, "");
+}
+
+const CALLOUT_RE = /^(EXCEPTION|EXCEPTIONS|User Note|Note|COMMENTARY)s?:\s*/i;
+
 function SectionBlock({
   row,
   isRoot,
-  indent,
+  relativeDepth,
   pdfId,
   refIndex,
   onJump,
 }: {
   row: OutlineRow;
   isRoot: boolean;
-  indent: number;
+  relativeDepth: number;
   pdfId: number | null;
   refIndex: Map<string, OutlineRow>;
   onJump: (id: number) => void;
@@ -663,47 +699,35 @@ function SectionBlock({
   const title = row.section_title || "";
   const num = row.section_number;
 
-  // Depth controls visual hierarchy. Root node of the reading view gets
-  // the page-title treatment; deeper subsections get progressively
-  // smaller / more indented. This mirrors how UpCodes renders a chapter:
-  // one big chapter title then a flowing stream of subsection blocks.
-  const HeadTag: "h1" | "h2" | "h3" | "h4" =
-    isRoot ? "h1" : indent === 0 ? "h2" : indent === 1 ? "h3" : "h4";
-  const headClass = {
-    h1: "text-2xl font-semibold text-surface-50",
-    h2: "text-xl font-semibold text-surface-50",
-    h3: "text-base font-semibold text-surface-50",
-    h4: "text-sm font-semibold text-surface-50 uppercase tracking-wide",
-  }[HeadTag];
-
   const paragraphs = useMemo(
     () => reflow(row.full_text || "", row.section_number),
     [row.full_text, row.section_number],
   );
 
-  return (
-    <section
-      id={`sec-${row.id}`}
-      className={isRoot ? "mb-8" : "mt-6"}
-      style={{ paddingLeft: indent * 14 }}
-    >
-      <HeadTag className={`${headClass} flex items-baseline gap-2`}>
-        <span className="font-mono text-accent">{num}</span>
-        <span>{title}</span>
-      </HeadTag>
-
-      {row.has_ca_amendment && row.amendment_agency && (
-        <div className="mt-1 text-xs inline-block px-2 py-0.5 rounded bg-amber-900/40 text-amber-200">
-          {row.amendment_agency} amendment
-        </div>
-      )}
+  const innerContent = (
+    <>
+      <SectionHeader
+        num={num}
+        title={title}
+        isRoot={isRoot}
+        relativeDepth={relativeDepth}
+      />
 
       {paragraphs.length > 0 && (
-        <div className="mt-2 text-[15px] leading-7 text-surface-50 space-y-3">
+        <div className="mt-3 text-surface-50 space-y-4">
           {paragraphs.map((p, i) => {
+            const calloutMatch = p.match(CALLOUT_RE);
+            if (calloutMatch) {
+              const stripped = p.slice(calloutMatch[0].length);
+              return (
+                <Callout key={i} label={calloutMatch[1].toUpperCase()}>
+                  {linkifyRefs(stripped, refIndex, onJump)}
+                </Callout>
+              );
+            }
             const formula = isFormulaLine(p);
             const classes = formula
-              ? "pl-6 -indent-6 font-mono text-[14px] whitespace-pre-wrap"
+              ? "pl-6 -indent-6 font-mono text-[15px] whitespace-pre-wrap"
               : isListItem(p)
                 ? "pl-6 -indent-6"
                 : "";
@@ -717,7 +741,7 @@ function SectionBlock({
       )}
 
       {pdfId != null && row.page_number != null && (
-        <div className="mt-3 text-xs text-surface-100">
+        <div className="mt-4 text-xs text-surface-100">
           {showPage ? (
             <PdfPager
               pdfId={pdfId}
@@ -735,7 +759,114 @@ function SectionBlock({
           )}
         </div>
       )}
+    </>
+  );
+
+  // Amendment sidebar: wrap the whole section in a left-border block
+  // instead of a floating chip.
+  const amendmentWrap = row.has_ca_amendment && row.amendment_agency;
+
+  // Top margin depends on depth: chapters get the most air, subsections
+  // least. Keeps the overall outline rhythm relaxed without the ragged
+  // paddingLeft-based indentation the old layout used.
+  const topMargin = isRoot ? "" : relativeDepth === 0 ? "mt-12" : relativeDepth === 1 ? "mt-8" : "mt-6";
+
+  return (
+    <section
+      id={`sec-${row.id}`}
+      className={`${isRoot ? "mb-10" : topMargin} scroll-mt-6`}
+    >
+      {/* Dual anchor so future href="#26-1-2" deep-links work. */}
+      <a id={slugifySectionNumber(num)} aria-hidden className="sr-only" />
+      {amendmentWrap ? (
+        <div className="border-l-2 border-amber-500 pl-4 -ml-4">
+          <div className="text-[11px] font-semibold uppercase tracking-wider text-amber-600 mb-1">
+            {row.amendment_agency} amendment
+          </div>
+          {innerContent}
+        </div>
+      ) : (
+        innerContent
+      )}
     </section>
+  );
+}
+
+/**
+ * UpCodes-style section header. Root drill-down target gets a two-line
+ * treatment (small accent "CHAPTER 26" eyebrow + big title). Nested
+ * levels keep the section number inline with the title in an accent
+ * color, using tabular-nums so numbers right-align in the visual gutter.
+ */
+function SectionHeader({
+  num,
+  title,
+  isRoot,
+  relativeDepth,
+}: {
+  num: string;
+  title: string;
+  isRoot: boolean;
+  relativeDepth: number;
+}) {
+  if (isRoot) {
+    return (
+      <header>
+        <div className="text-xs font-semibold tracking-[0.2em] uppercase text-accent">
+          {num}
+        </div>
+        <h1 className="text-3xl font-semibold mt-1 text-surface-50 leading-tight">
+          {title}
+        </h1>
+      </header>
+    );
+  }
+  if (relativeDepth === 0) {
+    return (
+      <h2 className="text-2xl font-semibold text-surface-50 flex items-baseline gap-3 leading-tight">
+        <span className="text-accent tabular-nums">{num}</span>
+        <span>{title}</span>
+      </h2>
+    );
+  }
+  if (relativeDepth === 1) {
+    return (
+      <h3 className="text-lg font-semibold text-surface-50 flex items-baseline gap-2 leading-snug">
+        <span className="text-accent tabular-nums">{num}</span>
+        <span>{title}</span>
+      </h3>
+    );
+  }
+  // Deepest levels: small, capitalized metadata-style.
+  return (
+    <h4 className="text-sm font-semibold text-surface-100 flex items-baseline gap-2 uppercase tracking-wide">
+      <span className="text-accent tabular-nums normal-case tracking-normal">
+        {num}
+      </span>
+      <span>{title}</span>
+    </h4>
+  );
+}
+
+/**
+ * Bordered aside used for EXCEPTION, User Note, and COMMENTARY blocks
+ * inside a section. UpCodes uses a left-border accent strip with a
+ * small uppercase label above the body.
+ */
+function Callout({
+  label,
+  children,
+}: {
+  label: string;
+  children: ReactNode;
+}) {
+  return (
+    <aside className="my-2 border-l-2 border-accent pl-4 py-2 bg-surface-800/60 rounded-r">
+      <div className="text-[11px] font-semibold uppercase tracking-wider text-accent mb-1">
+        {label}
+      </div>
+      <div>{children}</div>
+    </aside>
   );
 }
 

@@ -39,6 +39,12 @@
 }
 
 @layer base {
+  html {
+    /* Smooth in-page anchor scrolls — used when the Code Browser's
+       cross-reference links jump to a subsection inside the same
+       chapter view. */
+    scroll-behavior: smooth;
+  }
   html,
   body,
   #root {
