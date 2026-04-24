@@ -125,19 +125,21 @@ class DocumentExtractor:
     def extract(
         self,
         pdf_path: str,
-        progress: Optional[Callable[[int, int], None]] = None,
+        progress: Optional[Callable[[int, int, int, bool], None]] = None,
     ) -> ExtractedDocument:
         """Extract all sections from ``pdf_path``.
 
         Args:
             pdf_path: Path to the PDF on disk.
-            progress: Optional callable ``(done_pages, total_pages)`` invoked
-                while pages are being text-extracted / OCR'd. Fires every
-                ~2% of pages, plus one final tick at ``(total, total)``.
-                The Imports UI wires this to update ``records_processed``
-                during the ``parsing`` phase so the bar moves instead of
-                freezing on the phase label — important for large scanned
-                PDFs whose extraction is OCR-bound and can take many minutes.
+            progress: Optional callable ``(done_pages, total_pages,
+                ocr_pages_so_far, did_ocr_this_page)`` invoked while pages
+                are being text-extracted / OCR'd. Fires once per page
+                (cheap) plus one final tick at ``(total, total, ...)``.
+                The Imports UI wires this to update per-page counters +
+                OCR stats during the ``parsing`` phase so the bar moves
+                instead of freezing on the phase label — important for
+                large scanned PDFs whose extraction is OCR-bound and can
+                take many minutes.
         """
         result = ExtractedDocument()
 
@@ -211,7 +213,7 @@ class DocumentExtractor:
         self,
         doc: fitz.Document,
         result: ExtractedDocument,
-        progress: Optional[Callable[[int, int], None]] = None,
+        progress: Optional[Callable[[int, int, int, bool], None]] = None,
     ) -> List[str]:
         """Extract raw text per page, with running headers/footers stripped.
 
@@ -220,24 +222,28 @@ class DocumentExtractor:
         """
         raw: List[List[str]] = []
         n = len(doc)
-        # Don't hammer the progress callback — ~50 evenly-spaced ticks
-        # across the whole PDF plus one final tick at the end is plenty
-        # for a UI bar.
-        tick_every = max(1, n // 50)
+        # Fire the callback once per page. Each tick does one short SQL
+        # update on a worker thread, which is negligible next to the
+        # per-page text-extract/OCR cost and lets the UI show "page X of
+        # Y" in real time rather than in ~50-page jumps.
         for page_idx in range(n):
             page = doc.load_page(page_idx)
             text = page.get_text() or ""
+            did_ocr = False
             if len(text.strip()) < self.MIN_TEXT_CHARS_PER_PAGE:
                 ocr_text = _ocr_page(page)
                 if len(ocr_text.strip()) >= self.MIN_TEXT_CHARS_PER_PAGE:
                     text = ocr_text
                     result.ocr_flagged_pages.append(page_idx + 1)
+                    did_ocr = True
             raw.append([ln for ln in text.splitlines() if ln.strip()])
-            if progress is not None and (
-                page_idx % tick_every == 0 or page_idx == n - 1
-            ):
+            if progress is not None:
                 try:
-                    progress(page_idx + 1, n)
+                    progress(
+                        page_idx + 1, n,
+                        len(result.ocr_flagged_pages),
+                        did_ocr,
+                    )
                 except Exception:
                     # Progress reporting is best-effort; never fail the
                     # extraction over a UI-only update.

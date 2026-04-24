@@ -65,6 +65,66 @@ current_llm_model = OLLAMA_MODEL
 # import_svc module used directly via import_svc.import_pdf()
 
 
+def _spawn_import_task(coro, import_log_id: int, context: str):
+    """Kick off an import coroutine with a done-callback.
+
+    A plain ``asyncio.create_task`` will swallow an unhandled exception
+    into the task object — the task dies, the exception ends up only in
+    asyncio's default handler, and ``import_logs`` stays stuck on
+    ``status='processing'`` forever. That produced silent failures until
+    an operator noticed a row that never completed.
+
+    This wrapper attaches a callback that:
+      * logs the traceback with the import_log_id + context
+      * flips the row to ``status='error', phase='crashed'`` with the
+        exception message so the UI shows a red pill instead of a
+        spinner that never ends.
+    """
+    task = asyncio.create_task(coro)
+
+    def _on_done(t: asyncio.Task):
+        if t.cancelled():
+            logger.warning("import task cancelled: log_id=%s (%s)", import_log_id, context)
+            asyncio.create_task(_mark_import_crashed(
+                import_log_id, "Import task cancelled", "cancelled",
+            ))
+            return
+        exc = t.exception()
+        if exc is None:
+            return
+        logger.error(
+            "import task crashed: log_id=%s (%s): %r",
+            import_log_id, context, exc, exc_info=exc,
+        )
+        asyncio.create_task(_mark_import_crashed(
+            import_log_id, f"{type(exc).__name__}: {exc}", "crashed",
+        ))
+
+    task.add_done_callback(_on_done)
+    return task
+
+
+async def _mark_import_crashed(import_log_id: int, message: str, phase: str):
+    """Flip an import_logs row to status='error' after its worker died."""
+    try:
+        async with db_pool.acquire() as conn:
+            # Only overwrite if the row is still in a non-terminal state —
+            # if the worker already updated itself to completed/error, don't
+            # stomp its reason with our generic "crashed" label.
+            await conn.execute(
+                """UPDATE import_logs
+                      SET status = 'error', phase = $1,
+                          error_message = COALESCE(error_message, $2),
+                          stage_detail = 'Import worker exited unexpectedly',
+                          completed_at = NOW(), updated_at = NOW()
+                    WHERE id = $3
+                      AND status NOT IN ('completed', 'error')""",
+                phase, message[:500], import_log_id,
+            )
+    except Exception:
+        logger.exception("failed to mark import_log %s as crashed", import_log_id)
+
+
 # Pydantic Models
 class HealthResponse(BaseModel):
     status: str
@@ -231,6 +291,27 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Failed to initialize database pool: {e}")
         raise
+
+    # Apply additive SQL migrations in backend/migrations/. Each file uses
+    # IF NOT EXISTS guards so re-running is a no-op; run in lexical order so
+    # later migrations can depend on earlier ones.
+    try:
+        mig_dir = os.path.join(os.path.dirname(__file__), "migrations")
+        if os.path.isdir(mig_dir):
+            files = sorted(f for f in os.listdir(mig_dir) if f.endswith(".sql"))
+            async with db_pool.acquire() as conn:
+                for fname in files:
+                    path = os.path.join(mig_dir, fname)
+                    try:
+                        with open(path, "r", encoding="utf-8") as fh:
+                            sql = fh.read()
+                        if sql.strip():
+                            await conn.execute(sql)
+                            logger.info("Applied migration %s", fname)
+                    except Exception as e:
+                        logger.warning("Migration %s failed: %s", fname, e)
+    except Exception as e:
+        logger.warning("Migration runner error: %s", e)
 
     # Initialize Claude client
     if CLAUDE_API_KEY and CLAUDE_API_KEY != "sk-ant-CHANGEME":
@@ -1070,7 +1151,7 @@ async def upload_pdf(
 
         # Start parse+index in background; pass the log_id so progress
         # lands on the same row the upload endpoint just created.
-        asyncio.create_task(
+        _spawn_import_task(
             import_svc.import_pdf(
                 file_path=temp_file_path,
                 code_book_id=code_book_id,
@@ -1079,7 +1160,12 @@ async def upload_pdf(
                 source_id=source_id,
                 import_log_id=import_log_id,
                 source_pdf_id=pdf_id,
-            )
+                ollama_url=OLLAMA_URL,
+                ollama_model=OLLAMA_MODEL,
+                ollama_num_ctx=OLLAMA_NUM_CTX,
+            ),
+            import_log_id=import_log_id,
+            context=f"upload pdf_id={pdf_id} book={code_book_id}",
         )
 
         logger.info(
@@ -1245,7 +1331,12 @@ async def reindex_pdf(pdf_id: int):
                 source_id, code_book_id, pdf_id, safe_name,
             )
 
-        asyncio.create_task(
+        # Reindex path: the operator already manually confirmed this PDF
+        # belongs to this book when they originally uploaded it (or when
+        # they hit /retry after an error-phase row). Skip the identity
+        # check so retries don't keep re-paying the Ollama cost — they're
+        # overwhelmingly going to be "yes, still the same book".
+        _spawn_import_task(
             import_svc.import_pdf(
                 file_path=temp_file_path,
                 code_book_id=code_book_id,
@@ -1254,7 +1345,13 @@ async def reindex_pdf(pdf_id: int):
                 source_id=source_id,
                 import_log_id=import_log_id,
                 source_pdf_id=pdf_id,
-            )
+                ollama_url=OLLAMA_URL,
+                ollama_model=OLLAMA_MODEL,
+                ollama_num_ctx=OLLAMA_NUM_CTX,
+                skip_identity_check=True,
+            ),
+            import_log_id=import_log_id,
+            context=f"reindex pdf_id={pdf_id} book={code_book_id}",
         )
 
         logger.info(
@@ -1773,6 +1870,68 @@ async def scrape_icc_direct(request: ScrapeICCRequest) -> ScrapeResponse:
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _import_row_to_dict(r) -> Dict[str, Any]:
+    """Serialize an import_logs row (with optional book/pdf joins) for the UI.
+
+    Produces the same shape for both the list and single-import endpoints so
+    the frontend can bind one type to both. All extended progress fields
+    (current_page, ocr_pages_count, stage_detail, etc.) are included when
+    present on the row; they default to None/0 for pre-migration rows.
+    """
+    # asyncpg.Record supports `in` and `[]` but not `.get()`; this helper
+    # lets us treat an optional joined column (book_name etc.) as missing
+    # when the calling query didn't select it.
+    def col(key: str, default=None):
+        try:
+            return r[key]
+        except (KeyError, IndexError):
+            return default
+
+    total = r["records_total"] or 0
+    processed = r["records_processed"] or 0
+    phase = r["phase"] or "queued"
+    current_page = col("current_page")
+    total_pages = col("total_pages")
+    # Prefer page-level percent during parse, section-level otherwise.
+    pct: Optional[int] = None
+    if phase == "parsing" and total_pages:
+        pct = int(100 * (current_page or 0) / total_pages)
+    elif total:
+        pct = int(100 * processed / total)
+    return {
+        "id": r["id"],
+        "source_id": r["source_id"],
+        "source_type": col("source_type"),
+        "status": r["status"],
+        "phase": phase,
+        "code_book_id": r["code_book_id"],
+        "book_name": col("book_name"),
+        "book_abbreviation": col("book_abbreviation"),
+        "book_part_number": col("book_part_number"),
+        "pdf_id": r["pdf_id"],
+        "pdf_size_bytes": col("pdf_size_bytes"),
+        "filename": r["filename"],
+        "records_total": total or None,
+        "records_processed": processed,
+        "records_imported": r["records_imported"] or 0,
+        "records_failed": r["records_failed"] or 0,
+        "current_page": current_page,
+        "total_pages": total_pages,
+        "ocr_pages_count": col("ocr_pages_count", 0) or 0,
+        "toc_entries_count": col("toc_entries_count"),
+        "current_section_number": col("current_section_number"),
+        "stage_detail": col("stage_detail"),
+        "references_found": col("references_found", 0) or 0,
+        "started_parsing_at": col("started_parsing_at").isoformat() if col("started_parsing_at") else None,
+        "started_indexing_at": col("started_indexing_at").isoformat() if col("started_indexing_at") else None,
+        "percent": pct,
+        "error_message": r["error_message"],
+        "imported_at": r["imported_at"].isoformat() if r["imported_at"] else None,
+        "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
+        "completed_at": r["completed_at"].isoformat() if r["completed_at"] else None,
+    }
+
+
 @app.get("/api/imports")
 async def get_imports(limit: int = Query(20, ge=1, le=100)):
     """Recent + active imports with joined metadata for the dashboard.
@@ -1790,6 +1949,10 @@ async def get_imports(limit: int = Query(20, ge=1, le=100)):
                        il.code_book_id, il.pdf_id, il.filename,
                        il.records_total, il.records_processed,
                        il.records_imported, il.records_failed,
+                       il.current_page, il.total_pages, il.ocr_pages_count,
+                       il.toc_entries_count, il.current_section_number,
+                       il.stage_detail, il.references_found,
+                       il.started_parsing_at, il.started_indexing_at,
                        il.error_message, il.imported_at, il.updated_at,
                        il.completed_at,
                        cb.code_name AS book_name,
@@ -1806,36 +1969,7 @@ async def get_imports(limit: int = Query(20, ge=1, le=100)):
                 """,
                 limit,
             )
-
-            out = []
-            for r in rows:
-                total = r["records_total"] or 0
-                processed = r["records_processed"] or 0
-                pct = int(100 * processed / total) if total else None
-                out.append({
-                    "id": r["id"],
-                    "source_id": r["source_id"],
-                    "source_type": r["source_type"],
-                    "status": r["status"],
-                    "phase": r["phase"] or "queued",
-                    "code_book_id": r["code_book_id"],
-                    "book_name": r["book_name"],
-                    "book_abbreviation": r["book_abbreviation"],
-                    "book_part_number": r["book_part_number"],
-                    "pdf_id": r["pdf_id"],
-                    "pdf_size_bytes": r["pdf_size_bytes"],
-                    "filename": r["filename"],
-                    "records_total": total or None,
-                    "records_processed": processed,
-                    "records_imported": r["records_imported"] or 0,
-                    "records_failed": r["records_failed"] or 0,
-                    "percent": pct,
-                    "error_message": r["error_message"],
-                    "imported_at": r["imported_at"].isoformat() if r["imported_at"] else None,
-                    "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
-                    "completed_at": r["completed_at"].isoformat() if r["completed_at"] else None,
-                })
-            return out
+            return [_import_row_to_dict(r) for r in rows]
     except Exception as e:
         logger.error(f"Imports list error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -1847,38 +1981,163 @@ async def get_import(import_log_id: int):
     try:
         async with db_pool.acquire() as conn:
             r = await conn.fetchrow(
-                """SELECT il.*, cb.code_name AS book_name
+                """SELECT il.*, cb.code_name AS book_name,
+                          cb.abbreviation AS book_abbreviation,
+                          cb.part_number AS book_part_number,
+                          cbp.size_bytes AS pdf_size_bytes,
+                          isrc.source_type
                    FROM import_logs il
                    LEFT JOIN code_books cb ON cb.id = il.code_book_id
+                   LEFT JOIN code_book_pdfs cbp ON cbp.id = il.pdf_id
+                   LEFT JOIN import_sources isrc ON isrc.id = il.source_id
                    WHERE il.id = $1""",
                 import_log_id,
             )
         if not r:
             raise HTTPException(status_code=404, detail="import not found")
-        total = r["records_total"] or 0
-        processed = r["records_processed"] or 0
-        return {
-            "id": r["id"],
-            "status": r["status"],
-            "phase": r["phase"] or "queued",
-            "code_book_id": r["code_book_id"],
-            "book_name": r["book_name"],
-            "pdf_id": r["pdf_id"],
-            "filename": r["filename"],
-            "records_total": total or None,
-            "records_processed": processed,
-            "records_imported": r["records_imported"] or 0,
-            "records_failed": r["records_failed"] or 0,
-            "percent": int(100 * processed / total) if total else None,
-            "error_message": r["error_message"],
-            "imported_at": r["imported_at"].isoformat() if r["imported_at"] else None,
-            "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
-            "completed_at": r["completed_at"].isoformat() if r["completed_at"] else None,
-        }
+        return _import_row_to_dict(r)
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Import detail error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/imports/{import_log_id}")
+async def delete_import(
+    import_log_id: int,
+    delete_sections: bool = Query(
+        True,
+        description="Also delete the code_sections this import produced.",
+    ),
+    delete_pdf: bool = Query(
+        True,
+        description=(
+            "Also delete the stored PDF bytes. Ignored if other import_logs "
+            "still reference this pdf_id (those would break)."
+        ),
+    ),
+):
+    """Delete an import_log row, and optionally its produced sections + PDF.
+
+    UX contract:
+      - Always deletes the import_log row itself.
+      - ``delete_sections`` removes every ``code_sections`` row that was
+        produced by this PDF (joined via ``source_pdf_id``). Cascades take
+        care of ``code_section_versions`` and ``code_references`` on the
+        source side; cross-refs *into* these sections from other codes
+        become NULL (handled by the FK ``ON DELETE SET NULL``).
+      - ``delete_pdf`` removes the stored PDF bytes, but only if no other
+        import_log still points at it (otherwise we'd leave an orphan log
+        row with ``pdf_id`` silently NULLed, which would be confusing).
+
+    Returns the counts of each kind of row removed so the UI can show a
+    "Deleted X sections, 1 PDF" toast.
+    """
+    try:
+        async with db_pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT id, pdf_id, code_book_id FROM import_logs WHERE id = $1",
+                    import_log_id,
+                )
+                if not row:
+                    raise HTTPException(status_code=404, detail="import not found")
+
+                pdf_id = row["pdf_id"]
+                sections_deleted = 0
+                pdf_deleted = False
+
+                # Delete the indexed sections first — references cascade.
+                if delete_sections and pdf_id is not None:
+                    deleted_sections = await conn.execute(
+                        "DELETE FROM code_sections WHERE source_pdf_id = $1",
+                        pdf_id,
+                    )
+                    # asyncpg returns "DELETE N"
+                    try:
+                        sections_deleted = int(deleted_sections.split()[-1])
+                    except (ValueError, IndexError):
+                        sections_deleted = 0
+
+                # Drop the import_log (FK on pdf_id is SET NULL so this
+                # doesn't block on the PDF still existing).
+                await conn.execute(
+                    "DELETE FROM import_logs WHERE id = $1", import_log_id,
+                )
+
+                # Drop the PDF bytes if no other log references it. We
+                # check AFTER deleting the log so the self-reference is
+                # already gone.
+                if delete_pdf and pdf_id is not None:
+                    other_refs = await conn.fetchval(
+                        "SELECT count(*) FROM import_logs WHERE pdf_id = $1",
+                        pdf_id,
+                    )
+                    if not other_refs:
+                        del_pdf = await conn.execute(
+                            "DELETE FROM code_book_pdfs WHERE id = $1", pdf_id,
+                        )
+                        try:
+                            pdf_deleted = int(del_pdf.split()[-1]) > 0
+                        except (ValueError, IndexError):
+                            pdf_deleted = False
+
+        return {
+            "deleted": True,
+            "import_log_id": import_log_id,
+            "sections_deleted": sections_deleted,
+            "pdf_deleted": pdf_deleted,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Delete import error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/imports/{import_log_id}/retry")
+async def retry_import(import_log_id: int):
+    """Re-run an import against the PDF bytes still stored in the database.
+
+    This is the operator-facing path for failure-mode recovery after the
+    empty-extraction / all-quarantined / crashed phases introduced in
+    migration 003. Unlike ``/api/code-book-pdfs/{pdf_id}/reindex`` — which
+    takes a pdf_id and is the "refresh everything" button — this endpoint
+    takes the import_log_id the UI already has on screen, which means the
+    Imports table can expose a one-click retry without the frontend having
+    to go fetch pdf_id first.
+
+    The semantics are otherwise identical to ``reindex_pdf``: supersede
+    any currently-live sections for the target book, create a fresh
+    import_logs row, spawn a wrapped worker, and return the new log id
+    for progress polling.
+    """
+    try:
+        async with db_pool.acquire() as conn:
+            log_row = await conn.fetchrow(
+                """SELECT id, pdf_id, code_book_id, status, phase
+                     FROM import_logs WHERE id = $1""",
+                import_log_id,
+            )
+        if not log_row:
+            raise HTTPException(status_code=404, detail="import not found")
+        if log_row["pdf_id"] is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "This import has no stored PDF to retry (pdf_id is NULL — "
+                    "scraper runs and imports whose PDF was deleted cannot "
+                    "be retried from here)."
+                ),
+            )
+        # Delegate to the existing reindex path so both endpoints produce
+        # identical state and we don't fork the ingest logic.
+        return await reindex_pdf(log_row["pdf_id"])
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Retry import error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

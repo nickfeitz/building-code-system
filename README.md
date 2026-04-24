@@ -9,10 +9,11 @@ Upload `ASCE-7-22.pdf`. A few minutes later you get:
 - A **hierarchical outline** of the whole standard — chapters, sections, subsections, appendices — that matches the printed Table of Contents, because the ingester reads the PDF's TOC and uses it as ground truth instead of guessing at structure.
 - A **reader view** that renders any chapter as one flowing document — chapter title, every subsection inline in document order, depth-indented, with section numbers as anchors. Soft line wraps from the PDF are collapsed into real prose; hyphenated wraps are repaired. Inline cross-references (`Section 26.5.2`, `Chapter 31`, `Figure 26.5-1B`, `Table 1.5-1`, `Appendix C`) are clickable and jump to the target within the same panel.
 - A **search bar** that does full-text (Postgres `tsvector` + `pg_trgm` fuzzy) and a hybrid semantic + lexical endpoint backed by `intfloat/e5-large-v2` embeddings, scoped to one book or the whole corpus.
-- A **"View PDF page" link** on every section that renders the exact original page as a PNG from the stored PDF bytes. Opt-in — you see clean code text first, not a PDF viewer.
+- A **"View PDF page" link** on every section that renders the exact original page as a PNG from the stored PDF bytes. Opt-in — you see clean code text first, not a PDF viewer. Rendered PNGs + raw PDF bytes are LRU-cached in-process with ETag/304 support and ±2-page prefetch so flipping pages is instant after the first render.
 - An **AI chat** panel that talks to local Ollama models (gemma/qwen/mistral/deepseek) with the indexed codes as grounding, or Anthropic Claude if you drop in an API key.
 - A **quarantine queue** for sections that failed extraction validation, plus a page-level flag button in the Review panel — "this page came out wrong" — so you can re-OCR or hand-edit later.
-- A **live dashboard** showing ingest progress, quarantine counts, per-book indexed section counts.
+- A **live import dashboard** that streams _every_ stage of the ingest in real time: byte-upload bar, then parse phase with *current page / total pages + OCR fallback counter*, then index phase with *current section number + cumulative references extracted*. Every stat (pages/sec, sections/sec, ETA, elapsed-per-phase) ticks in-place so you always know what the worker is doing on a multi-minute OCR-heavy book.
+- **Light & dark themes** with a persistent settings panel — the logo, surface palette, and chrome all swap together; the scale is driven by CSS variables so every Tailwind `bg-surface-*` / `text-surface-*` class flips the moment you toggle.
 
 ## The ingestion pipeline (how a PDF becomes code you can read)
 
@@ -31,7 +32,7 @@ Upload `ASCE-7-22.pdf`. A few minutes later you get:
                             └──────────────────────────────────┘
 ```
 
-Every step is live-streamed into `import_logs` with a `phase` + counters, so the Imports panel shows an actual progress bar, not a spinner.
+Every step is live-streamed into `import_logs` with a `phase` + fine-grained counters (`current_page`, `total_pages`, `ocr_pages_count`, `toc_entries_count`, `current_section_number`, `references_found`, `stage_detail`, per-phase `started_*_at`), so the Imports panel can show a real progress bar with a phase timeline and a dense stats grid — not a spinner.
 
 ### Why the text looks right
 
@@ -118,7 +119,7 @@ Services:
 
 1. Open http://localhost:3010, go to the **Catalog** panel.
 2. Find or create the book row (`ASCE/SEI 7-22`, etc.), click **Upload PDF**.
-3. Watch the **Imports** panel — it streams parse phases, TOC count, and rows indexed.
+3. Watch the **Imports** panel — it streams the byte-upload bar → per-page parse progress (with an OCR fallback counter) → per-section indexing (with the current section number + reference count) → completion. A phase timeline strip (Upload → Queue → Parse → Index → Done) stays in sync with the bar.
 4. When done, switch to the **Browser** panel, pick the book, click any chapter, read.
 
 ## Project layout

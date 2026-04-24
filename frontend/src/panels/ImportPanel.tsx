@@ -1,10 +1,100 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { uploadPdf, ApiError, asDuplicate, type UploadProgress } from "../api/client";
+import {
+  uploadPdf,
+  deleteImport,
+  ApiError,
+  asDuplicate,
+  type UploadProgress,
+} from "../api/client";
 import type { CatalogBook, CatalogResponse } from "../api/types";
 import { useCatalog } from "../hooks/useCatalog";
-import { useImports } from "../hooks/useImports";
-import { ImportsTable, ProgressBar } from "../components/ImportsTable";
+import { useImports, useImportJob } from "../hooks/useImports";
+import { ImportsTable, ImportProgressCard } from "../components/ImportsTable";
+
+/**
+ * One-click delete for the just-finished import card. Uses a single
+ * confirm step inline so the flow stays inside the card.
+ */
+function DeleteActiveJobButton({
+  jobId,
+  onDone,
+}: {
+  jobId: number;
+  onDone: () => void;
+}) {
+  const qc = useQueryClient();
+  const [armed, setArmed] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const fire = async () => {
+    setBusy(true);
+    setErr(null);
+    try {
+      await deleteImport(jobId);
+      qc.invalidateQueries({ queryKey: ["imports"] });
+      qc.invalidateQueries({ queryKey: ["catalog"] });
+      qc.invalidateQueries({ queryKey: ["stats"] });
+      onDone();
+    } catch (e) {
+      setErr(e instanceof ApiError ? e.message : String(e));
+      setArmed(false);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (err) {
+    return (
+      <span className="text-xs text-danger">
+        {err}{" "}
+        <button
+          className="underline hover:text-surface-50"
+          onClick={() => setErr(null)}
+          type="button"
+        >
+          ok
+        </button>
+      </span>
+    );
+  }
+
+  if (!armed) {
+    return (
+      <button
+        type="button"
+        onClick={() => setArmed(true)}
+        className="btn-ghost text-xs !bg-danger/20 !text-danger hover:!bg-danger/30"
+        title="Delete this import (and its sections/PDF)"
+      >
+        Delete import
+      </button>
+    );
+  }
+
+  return (
+    <span className="inline-flex items-center gap-2 text-xs">
+      <span className="text-danger">This removes the sections + PDF.</span>
+      <button
+        type="button"
+        onClick={fire}
+        disabled={busy}
+        className="btn-ghost text-xs !bg-danger !text-white hover:!bg-danger/80 disabled:opacity-50"
+      >
+        {busy ? "deleting…" : "Confirm"}
+      </button>
+      <button
+        type="button"
+        onClick={() => setArmed(false)}
+        disabled={busy}
+        className="btn-ghost text-xs"
+      >
+        Cancel
+      </button>
+    </span>
+  );
+}
 
 /** Compact picker rendering the catalog as an optgroup-free searchable list. */
 function BookPicker({
@@ -128,26 +218,6 @@ function BookPicker({
   );
 }
 
-function formatBytes(n: number): string {
-  const u = ["B", "KB", "MB", "GB"];
-  let v = n;
-  let i = 0;
-  while (v >= 1024 && i < u.length - 1) {
-    v /= 1024;
-    i++;
-  }
-  return `${v.toFixed(v >= 10 ? 0 : 1)} ${u[i]}`;
-}
-
-function formatRate(bps: number): string {
-  return `${formatBytes(bps)}/s`;
-}
-
-function etaSeconds(p: UploadProgress): number | null {
-  if (!p.total || p.bytesPerSec <= 0) return null;
-  return Math.max(0, (p.total - p.loaded) / p.bytesPerSec);
-}
-
 export function ImportPanel() {
   const catalog = useCatalog();
   const imports = useImports(25);
@@ -157,23 +227,45 @@ export function ImportPanel() {
   const [file, setFile] = useState<File | null>(null);
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState<UploadProgress | null>(null);
+  // Track the server-side import_log_id so we can render live post-processing
+  // stats (parsing page X, OCR N pages, indexing section §Y, …) after the
+  // byte-upload phase finishes.
+  const [activeJobId, setActiveJobId] = useState<number | null>(null);
+  const [uploadedFilename, setUploadedFilename] = useState<string | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
   const abortRef = useRef<(() => void) | null>(null);
+  const activeJob = useImportJob(activeJobId);
+
+  // When the server job reaches a terminal phase, invalidate caches so the
+  // catalog + stats reflect the new sections, then clear the active card
+  // after a short delay so the success state is visible briefly.
+  useEffect(() => {
+    const j = activeJob.data;
+    if (!j) return;
+    if (j.phase === "completed" || j.phase === "failed") {
+      qc.invalidateQueries({ queryKey: ["imports"] });
+      qc.invalidateQueries({ queryKey: ["catalog"] });
+      qc.invalidateQueries({ queryKey: ["stats"] });
+    }
+  }, [activeJob.data?.phase, qc]);
 
   const upload = async () => {
     if (!file || !book) return;
     setBusy(true);
     setMsg(null);
+    setActiveJobId(null);
+    setUploadedFilename(file.name);
     setProgress({ loaded: 0, total: file.size, fraction: 0, bytesPerSec: 0, elapsedMs: 0 });
     const handle = uploadPdf(book.id, file, setProgress);
     abortRef.current = handle.abort;
     try {
       const r = await handle;
       setMsg(
-        `Uploaded ${r.filename} → ${book.code_name}. Server queued import_log_id=${r.import_log_id}; watch its progress below.`
+        `Uploaded ${r.filename} → ${book.code_name}. Now running extraction, OCR (if needed), and indexing — live stats below.`
       );
       setFile(null);
       setProgress(null);
+      setActiveJobId(r.import_log_id);
       qc.invalidateQueries({ queryKey: ["imports"] });
       qc.invalidateQueries({ queryKey: ["catalog"] });
       qc.invalidateQueries({ queryKey: ["stats"] });
@@ -185,6 +277,7 @@ export function ImportPanel() {
           `${dup.current_sections} current section${dup.current_sections === 1 ? "" : "s"} indexed for this book. Nothing to do.`
         );
         setProgress(null);
+        setUploadedFilename(null);
       } else {
         setMsg(
           e instanceof ApiError
@@ -199,6 +292,18 @@ export function ImportPanel() {
   };
 
   const cancel = () => abortRef.current?.();
+
+  const dismissActive = () => {
+    setActiveJobId(null);
+    setUploadedFilename(null);
+    setMsg(null);
+  };
+
+  // Keep the card visible during the brief gap between the byte-upload
+  // resolving and the first /imports/{id} poll landing, so the UI doesn't
+  // flash empty.
+  const showingCard =
+    progress != null || activeJobId != null;
 
   return (
     <div className="h-full overflow-y-auto p-6 space-y-6">
@@ -249,21 +354,31 @@ export function ImportPanel() {
             )}
           </div>
 
-          {progress && (
-            <div className="space-y-1 mt-2">
-              <ProgressBar percent={Math.round(progress.fraction * 100)} phase="indexing" />
-              <div className="flex items-center justify-between text-xs text-surface-100">
-                <span>
-                  {formatBytes(progress.loaded)}
-                  {progress.total ? ` / ${formatBytes(progress.total)}` : ""}
-                  {progress.total ? ` · ${Math.round(progress.fraction * 100)}%` : ""}
-                </span>
-                <span>
-                  {formatRate(progress.bytesPerSec)}
-                  {etaSeconds(progress) != null &&
-                    ` · ETA ${Math.round(etaSeconds(progress)!)}s`}
-                </span>
-              </div>
+          {showingCard && (
+            <div className="mt-3 rounded-lg border border-surface-400 bg-surface-900 p-4">
+              <ImportProgressCard
+                upload={progress}
+                job={activeJob.data ?? null}
+                filename={uploadedFilename}
+                bare
+              />
+              {activeJob.data &&
+                (activeJob.data.phase === "completed" ||
+                  activeJob.data.phase === "failed") && (
+                  <div className="flex justify-end gap-2 mt-3">
+                    <DeleteActiveJobButton
+                      jobId={activeJob.data.id}
+                      onDone={dismissActive}
+                    />
+                    <button
+                      type="button"
+                      onClick={dismissActive}
+                      className="btn-ghost text-xs"
+                    >
+                      Dismiss
+                    </button>
+                  </div>
+                )}
             </div>
           )}
           {msg && <div className="text-xs text-surface-50">{msg}</div>}

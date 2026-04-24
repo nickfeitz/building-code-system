@@ -215,6 +215,22 @@ export interface ImportJob {
   records_processed: number;
   records_imported: number;
   records_failed: number;
+  /** Page currently being extracted (null until parse starts). */
+  current_page: number | null;
+  /** Total pages in the PDF (null until parse starts). */
+  total_pages: number | null;
+  /** Pages that fell back to OCR so far. */
+  ocr_pages_count: number;
+  /** TOC entries discovered after parse. */
+  toc_entries_count: number | null;
+  /** Section currently being indexed (set during the indexing phase). */
+  current_section_number: string | null;
+  /** Free-form human-readable description of the current sub-step. */
+  stage_detail: string | null;
+  /** Cumulative cross-references extracted so far. */
+  references_found: number;
+  started_parsing_at: string | null;
+  started_indexing_at: string | null;
   percent: number | null;
   error_message: string | null;
   imported_at: string | null;

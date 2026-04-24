@@ -75,6 +75,36 @@ export async function apiPost<T>(
   return (text ? JSON.parse(text) : (undefined as unknown)) as T;
 }
 
+export async function apiDelete<T>(path: string): Promise<T> {
+  const r = await fetch(`${API_BASE}${path}`, { method: "DELETE" });
+  if (!r.ok) await failFromResponse(r);
+  const text = await r.text();
+  return (text ? JSON.parse(text) : (undefined as unknown)) as T;
+}
+
+export interface DeleteImportResponse {
+  deleted: boolean;
+  import_log_id: number;
+  sections_deleted: number;
+  pdf_deleted: boolean;
+}
+
+/**
+ * Remove an import_log + (optionally) the sections it produced and the
+ * stored PDF bytes. The backend skips the PDF delete when another
+ * import_log still references it.
+ */
+export async function deleteImport(
+  importLogId: number,
+  opts: { deleteSections?: boolean; deletePdf?: boolean } = {},
+): Promise<DeleteImportResponse> {
+  const q = new URLSearchParams({
+    delete_sections: String(opts.deleteSections ?? true),
+    delete_pdf: String(opts.deletePdf ?? true),
+  });
+  return apiDelete<DeleteImportResponse>(`/imports/${importLogId}?${q}`);
+}
+
 export async function apiUpload<T>(path: string, formData: FormData): Promise<T> {
   const r = await fetch(`${API_BASE}${path}`, {
     method: "POST",
@@ -125,6 +155,17 @@ export interface ReindexResponse {
  */
 export async function reindexPdf(pdfId: number): Promise<ReindexResponse> {
   return apiPost<ReindexResponse>(`/code-book-pdfs/${pdfId}/reindex`);
+}
+
+/**
+ * Retry a failed import by its import_log_id. The backend looks up the
+ * pdf_id from the log row, supersedes the book's current sections, and
+ * kicks off a fresh parse. Use this when a row lands in status='error'
+ * (empty_extraction / all_quarantined / crashed) — it's the one-click
+ * "try again" from the Imports table.
+ */
+export async function retryImport(importLogId: number): Promise<ReindexResponse> {
+  return apiPost<ReindexResponse>(`/imports/${importLogId}/retry`);
 }
 
 /**
